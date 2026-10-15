@@ -90,7 +90,9 @@ def test_errors_carry_request_id(client):
 
 
 def test_health_and_ready(client):
-    assert client.get("/health").json() == {"status": "ok", "service": "auth-service"}
+    response = client.get("/health")
+    assert response.json() == {"status": "ok", "service": "auth-service", "version": "v1"}
+    assert response.headers["X-Service-Version"] == "v1"
     ready = client.get("/ready")
     assert ready.status_code == 200
     assert ready.json()["checks"]["database"] == "ok"

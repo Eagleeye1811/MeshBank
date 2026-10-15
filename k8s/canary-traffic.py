@@ -12,7 +12,6 @@ Supports:
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -23,21 +22,36 @@ from pathlib import Path
 import httpx
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR / "scripts"))
+from mesh_topology import kube_context  # noqa: E402
+
+# The router and both payment tracks live with payment-service (in the "gcp"
+# cluster when MESHBANK_TOPOLOGY=multi). Pinning the context means the script
+# never acts on whatever cluster kubectl currently points at.
+KUBECTL = ["kubectl", "--context", kube_context("payment-service")]
 ROUTER_CONFIG_PATH = ROOT_DIR / "k8s" / "mesh-router-config.yaml"
 ROUTER_URL = "http://localhost:30004"
 
 
 def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return res.returncode, res.stdout.strip(), res.stderr.strip()
 
 
 def get_current_split() -> tuple[int, int]:
     """Reads current weights from router configmap in cluster."""
-    ret, out, _ = run_cmd([
-        "kubectl", "get", "configmap", "payment-router-config", "-n", "meshbank",
-        "-o", "jsonpath={.data.nginx\\.conf}"
-    ])
+    ret, out, _ = run_cmd(
+        [
+            *KUBECTL,
+            "get",
+            "configmap",
+            "payment-router-config",
+            "-n",
+            "meshbank",
+            "-o",
+            "jsonpath={.data.nginx\\.conf}",
+        ]
+    )
     stable_match = re.search(r"server payment-service-stable[^\n]*weight=(\d+)", out)
     canary_match = re.search(r"server payment-service-canary[^\n]*weight=(\d+)", out)
     stable_w = int(stable_match.group(1)) if stable_match else 100
@@ -45,132 +59,77 @@ def get_current_split() -> tuple[int, int]:
     return stable_w, canary_w
 
 
+WEIGHTED_UPSTREAM = re.compile(r"(upstream payment_weighted_upstream \{\n)(.*?)(\n\s*\})", re.S)
+
+
+def render_router_config(stable_weight: int, canary_weight: int) -> str:
+    """The tracked router manifest with only the weighted split lines replaced."""
+    manifest = ROUTER_CONFIG_PATH.read_text(encoding="utf-8")
+    match = WEIGHTED_UPSTREAM.search(manifest)
+    if not match:
+        raise ValueError(f"payment_weighted_upstream block not found in {ROUTER_CONFIG_PATH}")
+    indent = re.match(r"\s*", match.group(2)).group(0)
+
+    def server(track: str, weight: int) -> str:
+        host = f"server payment-service-{track}.meshbank.svc.cluster.local:8004"
+        # NGINX rejects weight=0; a zero-weight backend is marked down instead.
+        if weight == 0:
+            return f"{indent}{host} down;"
+        return f"{indent}{host} weight={weight} max_fails=2 fail_timeout=5s;"
+
+    lines = "\n".join([server("stable", stable_weight), server("canary", canary_weight)])
+    return manifest[: match.start(2)] + lines + manifest[match.end(2) :]
+
+
 def set_split(stable_weight: int, canary_weight: int) -> bool:
-    """Updates the traffic router weights and reloads NGINX."""
-    print(f"\n[Setting Traffic Split] Stable (v1): {stable_weight}% | Canary (v2): {canary_weight}%")
+    """Applies new router weights to the cluster and restarts the router."""
+    if not (0 <= stable_weight <= 100 and 0 <= canary_weight <= 100):
+        print("  [ERROR] weights must be between 0 and 100")
+        return False
+    if stable_weight + canary_weight == 0:
+        print("  [ERROR] at least one track needs a non-zero weight")
+        return False
+    print(f"\n[Setting Traffic Split] Stable (v1): {stable_weight} | Canary (v2): {canary_weight}")
 
-    config_template = f"""apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: payment-router-config
-  namespace: meshbank
-data:
-  nginx.conf: |
-    pid /tmp/nginx.pid;
-    worker_processes 1;
-
-    events {{
-        worker_connections 1024;
-    }}
-
-    http {{
-        client_body_temp_path /tmp/client_temp;
-        proxy_temp_path       /tmp/proxy_temp_path;
-        fastcgi_temp_path     /tmp/fastcgi_temp;
-        uwsgi_temp_path       /tmp/uwsgi_temp;
-        scgi_temp_path        /tmp/scgi_temp;
-
-        resolver 10.96.0.10 valid=10s ipv6=off;
-
-        log_format router_json escape=json '{{'
-          '"time":"$time_iso8601",'
-          '"router":"payment-traffic-manager",'
-          '"client_ip":"$remote_addr",'
-          '"upstream":"$target_upstream",'
-          '"upstream_addr":"$upstream_addr",'
-          '"method":"$request_method",'
-          '"uri":"$request_uri",'
-          '"status":$status,'
-          '"request_time":$request_time'
-        '}}';
-
-        access_log /dev/stdout router_json;
-        error_log /dev/stderr warn;
-
-        # 1. Direct Stable Upstream
-        upstream payment_stable_upstream {{
-            server payment-service-stable.meshbank.svc.cluster.local:8004 max_fails=2 fail_timeout=5s;
-        }}
-
-        # 2. Direct Canary Upstream
-        upstream payment_canary_upstream {{
-            server payment-service-canary.meshbank.svc.cluster.local:8004 max_fails=2 fail_timeout=5s;
-        }}
-
-        # 3. Dynamic Weighted Split Upstream
-        upstream payment_weighted_upstream {{
-            {f"server payment-service-stable.meshbank.svc.cluster.local:8004 down;" if stable_weight == 0 else f"server payment-service-stable.meshbank.svc.cluster.local:8004 weight={stable_weight} max_fails=2 fail_timeout=5s;"}
-            {f"server payment-service-canary.meshbank.svc.cluster.local:8004 down;" if canary_weight == 0 else f"server payment-service-canary.meshbank.svc.cluster.local:8004 weight={canary_weight} max_fails=2 fail_timeout=5s;"}
-        }}
-
-        # Header-based override for A/B testing
-        map $http_x_canary $target_upstream {{
-            "always" "payment_canary_upstream";
-            "never"  "payment_stable_upstream";
-            default  "payment_weighted_upstream";
-        }}
-
-        server {{
-            listen 8004;
-            server_name _;
-
-            location / {
-                if ($request_method = 'OPTIONS') {
-                    add_header Access-Control-Allow-Origin "*" always;
-                    add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
-                    add_header Access-Control-Allow-Headers "*" always;
-                    return 204;
-                }
-
-                proxy_pass http://$target_upstream;
-                proxy_set_header Host $host;
-                proxy_set_header X-Real-IP $remote_addr;
-                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-
-                add_header Access-Control-Allow-Origin "*" always;
-                add_header Access-Control-Expose-Headers "X-Mesh-Track, X-Service-Version, X-Mesh-Router, Idempotent-Replayed" always;
-                add_header X-Mesh-Router "payment-traffic-manager" always;
-            }
-        }
-
-        server {
-            listen 9102;
-            server_name _;
-
-            location /metrics {
-                stub_status;
-            }
-
-            location /health {
-                default_type application/json;
-                add_header Access-Control-Allow-Origin "*" always;
-                return 200 '{"status":"ok","router":"payment-traffic-manager","target":"$target_upstream"}\n';
-            }
-        }
-    }
-"""
-    ROUTER_CONFIG_PATH.write_text(config_template, encoding="utf-8")
-    ret, _, err = run_cmd(["kubectl", "apply", "-f", str(ROUTER_CONFIG_PATH)])
-    if ret != 0:
-        print(f"  [ERROR] Failed to apply router config: {err}")
+    # Applied from stdin: the tracked manifest keeps its default split.
+    config = render_router_config(stable_weight, canary_weight)
+    res = subprocess.run(
+        [*KUBECTL, "apply", "-f", "-"], input=config, capture_output=True, text=True, check=False
+    )
+    if res.returncode != 0:
+        print(f"  [ERROR] Failed to apply router config: {res.stderr.strip()}")
         return False
 
-    # Trigger hot-reload of nginx in payment-router without dropping connections
-    run_cmd(["kubectl", "rollout", "restart", "deployment/payment-router", "-n", "meshbank"])
-    run_cmd(["kubectl", "rollout", "status", "deployment/payment-router", "-n", "meshbank", "--timeout=30s"])
-    print("  [OK] Router reloaded successfully.")
+    # subPath ConfigMap mounts never update in place, so roll the router.
+    for cmd in (
+        [*KUBECTL, "rollout", "restart", "deployment/payment-router", "-n", "meshbank"],
+        [
+            *KUBECTL,
+            "rollout",
+            "status",
+            "deployment/payment-router",
+            "-n",
+            "meshbank",
+            "--timeout=60s",
+        ],
+    ):
+        ret, _, err = run_cmd(cmd)
+        if ret != 0:
+            print(f"  [ERROR] {' '.join(cmd[1:3])} failed: {err}")
+            return False
+    print("  [OK] Router restarted with the new split.")
     return True
 
 
 def verify_distribution(num_requests: int = 100) -> dict[str, int]:
     """Sends N requests and tallies hits between stable and canary."""
-    print(f"\n[Verifying Traffic Distribution] Sending {num_requests} requests to {ROUTER_URL}/health...")
+    print(f"\n[Verifying Traffic Distribution] {num_requests} requests to {ROUTER_URL}/health...")
     counts: Counter[str] = Counter()
     versions: Counter[str] = Counter()
     errors = 0
 
     with httpx.Client(timeout=3.0) as client:
-        for i in range(1, num_requests + 1):
+        for _ in range(num_requests):
             try:
                 resp = client.get(f"{ROUTER_URL}/health")
                 if resp.status_code == 200:
@@ -259,31 +218,57 @@ def demo_rollback() -> None:
     # Start at 50/50
     set_split(50, 50)
     print("\n[Simulating Canary Failure] Scaling canary deployment to 0 replicas...")
-    run_cmd(["kubectl", "scale", "deployment/payment-service-canary", "-n", "meshbank", "--replicas=0"])
+    run_cmd(
+        [*KUBECTL, "scale", "deployment/payment-service-canary", "-n", "meshbank", "--replicas=0"]
+    )
     time.sleep(2)
 
-    print("[Health Monitor] Detecting canary failure and executing instant rollback to 100% stable...")
+    print(
+        "[Health Monitor] Detecting canary failure and executing instant rollback to 100% stable..."
+    )
     set_split(100, 0)
-    res = verify_distribution(50)
+    verify_distribution(50)
 
     print("\n[Recovery] Restoring canary deployment replicas to 1...")
-    run_cmd(["kubectl", "scale", "deployment/payment-service-canary", "-n", "meshbank", "--replicas=1"])
-    run_cmd(["kubectl", "rollout", "status", "deployment/payment-service-canary", "-n", "meshbank", "--timeout=60s"])
+    run_cmd(
+        [*KUBECTL, "scale", "deployment/payment-service-canary", "-n", "meshbank", "--replicas=1"]
+    )
+    run_cmd(
+        [
+            *KUBECTL,
+            "rollout",
+            "status",
+            "deployment/payment-service-canary",
+            "-n",
+            "meshbank",
+            "--timeout=60s",
+        ]
+    )
     print("  [OK] Canary pod restored and healthy.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="MeshBank Phase 2 Canary Traffic Manager")
-    parser.add_argument("--set-split", nargs=2, type=int, metavar=("STABLE", "CANARY"), help="Set split weights")
-    parser.add_argument("--verify", type=int, default=0, metavar="N", help="Verify distribution across N requests")
-    parser.add_argument("--test-header", action="store_true", help="Test header-based routing overrides")
-    parser.add_argument("--demo-rollout", action="store_true", help="Run full rollout lifecycle demo")
-    parser.add_argument("--demo-rollback", action="store_true", help="Run health failure & rollback demo")
+    parser.add_argument(
+        "--set-split", nargs=2, type=int, metavar=("STABLE", "CANARY"), help="Set split weights"
+    )
+    parser.add_argument(
+        "--verify", type=int, default=0, metavar="N", help="Verify distribution across N requests"
+    )
+    parser.add_argument(
+        "--test-header", action="store_true", help="Test header-based routing overrides"
+    )
+    parser.add_argument(
+        "--demo-rollout", action="store_true", help="Run full rollout lifecycle demo"
+    )
+    parser.add_argument(
+        "--demo-rollback", action="store_true", help="Run health failure & rollback demo"
+    )
 
     args = parser.parse_args()
 
     if args.set_split:
-        set_split(args.set_split[0], args.set_split[1])
+        return 0 if set_split(args.set_split[0], args.set_split[1]) else 1
     elif args.verify:
         verify_distribution(args.verify)
     elif args.test_header:

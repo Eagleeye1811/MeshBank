@@ -13,7 +13,9 @@ JWT_ENV := JWT_SIGNING_KEY_ID=$(JWT_SIGNING_KEY_ID) \
 	JWT_PRIVATE_KEY_FILE=$(abspath secrets/jwt/private/$(JWT_SIGNING_KEY_ID).pem)
 
 .PHONY: help install test test-services test-e2e lint format run run-service up down logs ps \
-        seed-demo seed-account recover reset-dev dev-keys preflight
+        seed-demo seed-account recover reset-dev dev-keys preflight frontend \
+        k8s-up k8s-down k8s-status k8s-test k8s-mtls-test k8s-canary-split k8s-canary-demo mesh-configs \
+        k8s-multi-up k8s-multi-down k8s-multi-status k8s-multi-test k8s-multi-mtls-test k8s-multi-canary-demo
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
@@ -40,9 +42,10 @@ dev-keys: ## Create the local RS256 JWT key pair in secrets/jwt (never overwrite
 preflight: ## Read-only environment checks (disk, Docker, tools, keys, PostgreSQL)
 	$(PY) scripts/preflight.py $(PREFLIGHT_ARGS)
 
-lint: ## Ruff lint + format check
+lint: ## Ruff lint + format check, generated mesh configs up to date
 	$(VENV)/bin/ruff check .
 	$(VENV)/bin/ruff format --check .
+	cd scripts && ../$(PY) generate_mesh_sidecars.py --check
 
 format: ## Apply ruff formatting and safe fixes
 	$(VENV)/bin/ruff check --fix .
@@ -81,18 +84,50 @@ recover: ## Trigger one recovery pass in transaction- and payment-service
 reset-dev: ## DELETE all local dev data (requires CONFIRM=yes)
 	CONFIRM=$(CONFIRM) scripts/reset_dev.sh
 
-k8s-up: ## Deploy MeshBank onto local kind Kubernetes cluster
-	powershell -File k8s/deploy.ps1
+k8s-up: ## Build images and deploy MeshBank (with mTLS mesh + canary) to a local kind cluster
+	PYTHON=$(abspath $(PY)) bash k8s/deploy.sh
 
-k8s-down: ## Tear down the MeshBank kind Kubernetes cluster
-	kind delete cluster --name meshbank
+k8s-down: ## Delete the MeshBank kind cluster (all in-cluster data is lost)
+	bash k8s/delete.sh single
 
 k8s-status: ## Check Kubernetes pod and service status
 	kubectl get pods,svc,endpoints -n meshbank
 
-k8s-test: ## Run the Kubernetes banking smoke test
+k8s-test: ## Run the Kubernetes banking smoke test (every service hop over mTLS)
 	$(PY) k8s/k8s-smoke-test.py
 
-frontend: ## Start the MeshBank React + Vite + Tailwind dashboard (http://localhost:5173)
+k8s-mtls-test: ## Mesh security tests: plaintext bypass, untrusted certs, caller authorization
+	$(PY) k8s/test-mesh-mtls.py
+
+k8s-canary-split: ## Set the payment canary split: make k8s-canary-split STABLE=90 CANARY=10
+	$(PY) k8s/canary-traffic.py --set-split $(STABLE) $(CANARY)
+
+k8s-canary-demo: ## Canary rollout demo: 90/10 -> 50/50 -> 0/100 -> rollback
+	$(PY) k8s/canary-traffic.py --demo-rollout
+
+k8s-multi-up: ## Two kind clusters simulating AWS + GCP, joined by mTLS east-west gateways
+	PYTHON=$(abspath $(PY)) bash k8s/deploy-multicluster.sh
+
+k8s-multi-down: ## Delete both multi-cluster kind clusters (all in-cluster data is lost)
+	bash k8s/delete.sh multi
+
+k8s-multi-status: ## Pods in both clusters, with the cloud each node simulates
+	@for c in aws gcp; do echo "== kind-meshbank-$$c"; \
+		kubectl --context kind-meshbank-$$c get nodes -L meshbank.io/cloud --no-headers; \
+		kubectl --context kind-meshbank-$$c get pods -n meshbank -o wide; done
+
+k8s-multi-test: ## Banking smoke test across both clusters (cross-cluster hops over mTLS)
+	MESHBANK_TOPOLOGY=multi $(PY) k8s/k8s-smoke-test.py
+
+k8s-multi-mtls-test: ## Mesh security tests for both clusters, including the gateways
+	MESHBANK_TOPOLOGY=multi $(PY) k8s/test-mesh-mtls.py
+
+k8s-multi-canary-demo: ## Canary rollout demo on the gcp cluster
+	MESHBANK_TOPOLOGY=multi $(PY) k8s/canary-traffic.py --demo-rollout
+
+mesh-configs: ## Regenerate sidecar and gateway configs from scripts/mesh_topology.py
+	cd scripts && ../$(PY) generate_mesh_sidecars.py
+
+frontend: ## Dashboard at http://localhost:5173 (two clusters: make frontend MESHBANK_TOPOLOGY=multi)
 	cd frontend && npm run dev
 

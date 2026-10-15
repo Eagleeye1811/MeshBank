@@ -3,37 +3,54 @@
 **MeshBank: A Secure Multi-Cloud Service Mesh Infrastructure for a Cloud-Native Banking Platform**
 *Secure connections. Reliable banking. Across clouds.*
 
-MeshBank is a **simulated** banking platform. In later phases it will show secure
-service-to-service communication across two Kubernetes clusters that stand in for
-AWS and GCP. That communication will use a custom sidecar data plane, mTLS,
-iptables interception, adaptive load balancing and canary routing.
+MeshBank is a **simulated** banking platform. The repository contains:
 
-This repository currently contains **Phase 1: the banking microservices
-foundation**. It has six independently runnable FastAPI services with real
-persistence, validation, authentication, an idempotent transfer saga, and
-automated tests.
+* **Banking microservices** (Phase 1): six independently runnable FastAPI
+  services with real persistence, validation, authentication, an idempotent
+  transfer saga, and automated tests.
+* **Kubernetes deployment with a sidecar service mesh** (Phase 2, local `kind`
+  cluster): every service runs behind an NGINX sidecar, every
+  service-to-service call uses mutual TLS with per-service caller
+  authorization, and `payment-service` has a weighted canary release
+  ([section 16](#16-service-mesh-architecture--mtls-implementation),
+  [section 17](#17-phase-2-traffic-management--canary-deployment)).
+* A React dashboard (`frontend/`): a customer view (accounts, send money, pay
+  a bill) and a “Behind the scenes” view (service status, security checks,
+  canary release). See [`frontend/README.md`](frontend/README.md).
+
+**Multi-cloud is simulated, not real.** `make k8s-multi-up` splits the services
+across two local `kind` clusters named after AWS and GCP, joined by mTLS
+east-west gateways ([section 18](#18-two-cluster-mesh-aws--gcp-simulation)).
+They are Docker containers on one machine, not EKS or GKE.
 
 > All money is simulated. Nothing connects to real banks, payment gateways,
 > email/SMS providers, or production banking APIs.
 
 ---
 
-## 1. Phase 1 scope and what is *not* implemented
+## 1. Scope and what is *not* implemented
 
-| Implemented in Phase 1 | Not implemented (future phases) |
+| Implemented | Not implemented (future phases) |
 |---|---|
-| Six FastAPI services, each with its own database | Service mesh, sidecar proxies (Go) |
-| JWT auth (RS256 with key IDs, JWKS, rotation), login throttling, Argon2id password hashing | mTLS, workload identity, certificate management |
-| Ownership checks on every customer resource | iptables traffic interception |
-| Decimal-safe money, INR only | Cross-cluster / multi-cloud networking |
-| Durable, idempotent transfer saga with compensation and recovery | Adaptive load balancing, canary routing |
-| Deterministic fraud rules | Prometheus metrics, Grafana dashboards |
-| Simulated payment provider and simulated notification delivery | Kubernetes manifests |
-| Structured JSON logs with request-ID propagation | Rate limiting (`429`), refresh tokens, token revocation |
-| Docker images and Docker Compose | Alembic migrations (see [Limitations](#14-known-limitations-and-security-boundaries)) |
+| Six FastAPI services, each with its own database | Real cloud deployment (EKS/GKE); cross-cloud networking over the internet |
+| JWT auth (RS256 with key IDs, JWKS, rotation), login throttling, Argon2id password hashing | Custom (Go) sidecar proxies, iptables traffic interception |
+| Ownership checks on every customer resource | Automatic certificate issuance/rotation (a control plane) |
+| Decimal-safe money, INR only | Adaptive load balancing |
+| Durable, idempotent transfer saga with compensation and recovery | Prometheus metrics, Grafana dashboards |
+| Deterministic fraud rules | Rate limiting (`429`), refresh tokens, token revocation |
+| Simulated payment provider and simulated notification delivery | |
+| Structured JSON logs with request-ID propagation; Alembic migrations | |
+| Docker images and Docker Compose | |
+| Kubernetes manifests (kind) with PostgreSQL | |
+| NGINX sidecar mesh: mTLS on every service-to-service call, per-service caller authorization, NetworkPolicies | |
+| Weighted canary release of `payment-service` with header overrides | |
+| Two-cluster mesh (kind clusters simulating AWS and GCP) with SNI-routed east-west gateways | |
 
-Internal traffic between services is **plain HTTP**. A shared internal token
-authenticates it. **It is not encrypted.** JWTs authenticate customers. They do
+Transport security depends on how you run it. With `make run` or Docker
+Compose, internal traffic between services is **plain HTTP**, authenticated
+only by a shared internal token. On Kubernetes (`make k8s-up`) every
+service-to-service call goes through the sidecars over **mutual TLS**, and the
+internal token remains as a second check. JWTs authenticate customers; they do
 not provide transport security.
 
 ---
@@ -454,23 +471,25 @@ volumes, and refuses to run when `APP_ENV=production`. Normal startup
 
 ## 14. Known limitations and security boundaries
 
-* **No transport security.** Internal and external HTTP traffic is plaintext.
-  The Docker bridge network is **not** a service mesh and gives no
-  multi-cloud isolation.
+* **No transport security outside Kubernetes.** With `make run` or Compose,
+  internal and external HTTP traffic is plaintext; the Docker bridge network
+  is not a service mesh. On Kubernetes, service-to-service traffic is mTLS,
+  but customer traffic through the NodePorts is still plain HTTP (no ingress
+  TLS).
 * **Public keys are distributed as files.** Only the auth service can mint
   tokens. Other services verify locally with configured public keys; they do
   not fetch JWKS at runtime, so rotation means updating the key files. `/auth/verify`
   additionally checks that the user still exists and is active.
 * **The shared internal token** authenticates "some internal service", not a
-  specific service identity. mTLS SPIFFE-style identities replace it later.
+  specific service identity. On Kubernetes the sidecars add per-service
+  identity (mTLS + caller allow-lists); without Kubernetes the token is the
+  only control.
 * **No distributed ACID.** The saga guarantees at-most-once balance effects
   and eventual completion or compensation. In-flight money is temporarily
   visible in neither account.
-* **Schema management:** tables are created idempotently at startup
-  (`create_all`); nothing is ever dropped. **Alembic migrations are not yet
-  set up.** This is a deliberate Phase 1 simplification, since every schema
-  is new. Migrations must be added before the first schema change or the
-  PostgreSQL deployment.
+* **Schema management:** each service has Alembic migrations, applied at
+  startup in development (`DB_MIGRATION_MODE=upgrade`); production expects
+  `check` with migrations run as a separate step. Nothing is ever dropped.
 * **SQLite** is single-writer per database file, so each service should run
   one replica. Leases make concurrent recovery safe, but horizontal scaling
   needs PostgreSQL.
@@ -491,10 +510,11 @@ volumes, and refuses to run when `APP_ENV=production`. Normal startup
 
 ## 15. Planned phases
 
-1. **Phase 1 (this repository):** banking microservices foundation.
-2. **Phase 2:** container hardening and local deployment validation (image
-   scanning, Alembic, PostgreSQL), then Kubernetes manifests.
-3. **Service mesh:** two local Kubernetes clusters simulating
+1. **Phase 1 (done):** banking microservices foundation.
+2. **Phase 2 (done, single cluster):** Kubernetes manifests with PostgreSQL,
+   NGINX sidecar mesh with mTLS on every internal call, canary routing.
+3. **Multi-cluster mesh (local simulation done):** two local Kubernetes
+   clusters simulating
    **Cluster A — "AWS"** (auth, account, transaction) and
    **Cluster B — "GCP"** (payment, fraud, notification). These are simulations,
    not real cloud environments. The mesh adds custom Go sidecar proxies,
@@ -513,216 +533,218 @@ depend on transport.
 
 ## 16. Service Mesh Architecture & mTLS Implementation
 
-### 16.1 Architecture Overview
+### 16.1 Architecture
 
-MeshBank implements a lightweight, cloud-native sidecar service mesh data plane for secure inter-service communication between critical banking services (`transaction-service` and `payment-service`):
+Every service runs as a two-container pod. The application binds to
+`127.0.0.1:8080` and is reachable only through its NGINX sidecar:
+
+| Sidecar port | Purpose |
+|---|---|
+| `80xx` (plaintext) | Public API, kubelet probes, NodePort, payment router. Internal endpoints return `403 MTLS_REQUIRED`. |
+| `8443` (mTLS) | Service-to-service traffic. Requires a client certificate from the mesh CA **and** an authorized caller identity. |
+| `127.0.0.1:90xx` (egress) | The app calls e.g. `http://127.0.0.1:9002`; the sidecar opens mTLS to `account-service:8443` with its own certificate and verifies the server's. |
+| `9102` | `stub_status` metrics and sidecar health. |
+
+The call graph and allow-lists live in one file,
+[`scripts/mesh_topology.py`](scripts/mesh_topology.py). From it,
+`scripts/generate_mesh_certs.py` issues the certificates and
+`scripts/generate_mesh_sidecars.py` generates `k8s/mesh-sidecar-configs.yaml`
+(`make lint` fails if the generated file is stale).
+
+| Service | Accepts mTLS calls from | Calls (through its sidecar) |
+|---|---|---|
+| auth-service | nobody | — |
+| account-service | transaction, payment | — |
+| transaction-service | payment | account, fraud, notification |
+| payment-service (stable + canary) | nobody | account, transaction, fraud, notification |
+| fraud-service | transaction, payment | — |
+| notification-service | transaction, payment | — |
 
 ```
-+---------------------------------------------------------------------------------------------------+
-| Kubernetes Namespace: meshbank                                                                    |
-|                                                                                                   |
-|  +---------------------------------------+       mTLS (Port 8443)      +------------------------+ |
-|  | Pod: payment-service                  |   TLSv1.3 / AES_256_GCM    | Pod: transaction-svc   | |
-|  |                                       |============================>|                        | |
-|  | [payment-service app]                 |  Client: payment-service    | [mesh-sidecar proxy]   | |
-|  |   Listens on: 127.0.0.1:8080          |  Server: transaction-service|   Port 8443: mTLS      | |
-|  |                                       |                             |   Port 8003: Public In | |
-|  | [mesh-sidecar proxy]                  |                             |   Port 9102: Metrics   | |
-|  |   Port 8004: Public Ingress           |                             |            │           | |
-|  |   Port 9003: Egress Proxy ────────────┘                             |            ▼ localhost | |
-|  |   Port 9102: Metrics                                                | [transaction-svc app]  | |
-|  +---------------------------------------+                             |   Listens: 127.0.0.1   | |
-|                                                                        +------------------------+ |
-+---------------------------------------------------------------------------------------------------+
+ payment pod                                         account pod
+ ┌──────────────────────────────┐   mTLS :8443       ┌──────────────────────────────┐
+ │ app ──http──▶ 127.0.0.1:9002 │══════════════════▶│ sidecar: verify cert (mesh CA)│
+ │               sidecar egress │  client cert:      │  + caller ∈ {transaction,     │
+ │               (payment cert) │  CN=payment-...    │    payment} ──▶ 127.0.0.1:8080│
+ └──────────────────────────────┘                    └──────────────────────────────┘
 ```
 
-### 16.2 Core Security Controls
+### 16.2 Security controls
 
-1. **Mutual TLS (mTLS) Authentication:**
-   * Both sides of the communication verify cryptographic certificates issued by an internal **MeshBank Mesh Root CA**.
-   * Workload identities are encoded using SPIFFE Subject Alternative Names (SANs):
-     * `spiffe://meshbank.internal/ns/meshbank/sa/transaction-service`
-     * `spiffe://meshbank.internal/ns/meshbank/sa/payment-service`
-   * Communication strictly requires TLS 1.3/1.2 with forward secrecy (`TLS_AES_256_GCM_SHA384`).
-2. **Loopback Application Isolation & NetworkPolicy:**
-   * Core microservice application containers bind strictly to loopback (`127.0.0.1:8080`). They cannot be directly contacted from outside their Pod.
-   * All ingress and egress traffic is mediated through the sidecar proxy container.
-   * Kubernetes `NetworkPolicy` (`k8s/network-policy-mesh.yaml`) enforces that only authorized mesh traffic can reach the pods.
-3. **Strict Rejection of Bypass Attempts:**
-   * Sending plaintext HTTP requests directly to internal endpoints (`/internal/...`) on public ports 8003/8004 is rejected with `403 Forbidden` (`MTLS_REQUIRED`).
-   * Requests lacking client certificates are rejected with `400 Bad Request` (`No required SSL certificate was sent`).
-   * Requests presenting untrusted certificates (e.g., signed by an unauthorized/rogue CA) are rejected with `400 Bad Request` (`The SSL certificate error`).
-4. **Observability & Metrics:**
-   * Structured JSON logs capture client Subject DN (`ssl_client_s_dn`), verification status (`ssl_client_verify`), protocol, cipher, upstream latency, and response status.
-   * Dedicated `/metrics` endpoint on port `9102` provides active connection counts and traffic statistics.
+1. **Authentication:** workload certificates are signed by the MeshBank mesh
+   root CA (RSA 2048, generated locally by `generate_mesh_certs.py`). Each
+   carries the service's DNS names and a SPIFFE URI SAN
+   (`spiffe://meshbank.internal/ns/meshbank/sa/<service>`). TLS 1.2 and 1.3
+   are allowed.
+2. **Authorization:** the receiving sidecar maps the certificate subject CN
+   (the service's cluster DNS name) to an allow-list; anything else gets
+   `403 IDENTITY_NOT_AUTHORIZED`. NGINX cannot read URI SANs without extra
+   modules, so the check uses the CN; the CA signs both, so they cannot
+   disagree.
+3. **No bypass:** apps listen on loopback only. Internal endpoints are refused
+   on the public ports: everything under `/internal/`, plus fraud `/evaluate`
+   (fraud's public port serves only `/health` and `/ready`) and notification
+   `POST /notifications`.
+4. **NetworkPolicy** (`k8s/network-policy-mesh.yaml`): port 8443 only from
+   meshed pods; PostgreSQL only from meshed pods. Requires kind ≥ 0.24.
+5. **Certificate lifecycle:** certificates are reused across deploys and
+   reissued only when missing, expiring within 14 days, or signed by another
+   CA. `ROTATE_CERTS=1 make k8s-up` issues a new CA and restarts the pods.
+   Rotation is manual: there is no control plane yet.
+6. **Observability:** sidecar JSON access logs record the client DN, the
+   verification result, the authorized caller (`mesh_caller`), TLS protocol
+   and cipher, and upstream latency.
 
-### 16.3 Setup & Verification Commands
+### 16.3 Running it
 
-Generate certificates and deploy to the cluster:
-```powershell
-# 1. Generate Mesh Root CA and Workload Certificates
-.\.venv\Scripts\python.exe scripts\generate_mesh_certs.py
+Prerequisites: Docker Desktop running, `brew install kind kubectl`, and
+`make install` (Python venv).
 
-# 2. Deploy to Kubernetes (or use deploy.ps1)
-.\k8s\deploy.ps1
-
-# 3. Run the automated Service Mesh & mTLS Compliance Test Suite
-.\k8s\test-mesh-mtls.ps1
-```
-
-Or run directly with Python:
 ```bash
-python k8s/test-mesh-mtls.py
+make k8s-up          # build images, create the kind cluster, deploy everything
+make k8s-status
+make k8s-test        # banking smoke test; every service hop is mTLS
+make k8s-mtls-test   # security tests (below)
+make k8s-down        # delete the cluster
 ```
 
-### 16.4 Actual Test Results
+On Windows use `k8s\deploy.ps1` and `k8s\test-mesh-mtls.ps1`.
 
-```text
-======================================================================
-  MESHBANK SERVICE MESH & mTLS COMPLIANCE TEST SUITE
-======================================================================
+`make k8s-mtls-test` checks, for every service:
+* internal endpoints on the public NodePort return `403 MTLS_REQUIRED`;
+* the mTLS port rejects a client without a certificate and a certificate from
+  an untrusted CA (the attacker certificate even claims `payment-service`'s
+  name);
+* a trusted certificate of a service that is *not* an authorized caller gets
+  `403 IDENTITY_NOT_AUTHORIZED`;
+* each authorized caller succeeds.
 
---- Phase 1.1: Certificate & Workload Identity Artifacts ---
-  [PASS] Artifact Mesh Root CA exists
-  [PASS] Artifact payment-service client certificate exists
-  [PASS] Artifact payment-service private key exists
-  [PASS] Artifact transaction-service certificate exists
-  [PASS] Artifact transaction-service private key exists
-  [PASS] Artifact Attacker rogue certificate exists
-  [PASS] Artifact Attacker rogue key exists
-
---- Phase 1.2: Plaintext Bypass Rejection (Network Restriction) ---
-  [PASS] Plaintext request to transaction-service /internal/ is blocked (HTTP 403 MTLS_REQUIRED)
-  [PASS] Plaintext request to payment-service /internal/ is blocked (HTTP 403 MTLS_REQUIRED)
-
---- Phase 1.3: Direct mTLS Handshake & Identity Verification ---
-  [PASS] Request without client certificate is rejected by mTLS sidecar (HTTP 400 No Cert)
-  [PASS] Request with untrusted attacker certificate is rejected by mTLS sidecar (HTTP 400 SSL Error)
-  [PASS] Request with valid payment-service workload certificate succeeds (HTTP 200 OK)
-
---- Phase 1.4: In-Cluster Mesh Traffic Mediation ---
-  [PASS] End-to-End banking transaction & bill payment through mesh proxies (All 9 steps pass)
-
---- Phase 1.5: Sidecar Proxy Structured Logs & Metrics ---
-  [PASS] Transaction sidecar captured valid mTLS handshake with payment-service
-         Protocol=TLSv1.3, Cipher=TLS_AES_256_GCM_SHA384, Client-DN=OU=Mesh Workload,O=MeshBank,CN=payment-service.meshbank.svc.cluster.local
-  [PASS] Sidecar metrics endpoint (port 9102) active and recording stats
-
-======================================================================
-  TEST SUMMARY: 15 PASSED, 0 FAILED
-======================================================================
-```
+It then runs the smoke test and checks each receiving sidecar's logs for
+verified, authorized mTLS traffic.
 
 ---
 
 ## 17. Phase 2: Traffic Management & Canary Deployment
 
-### 17.1 Canary Architecture
+### 17.1 Canary architecture
 
-MeshBank implements proxy-based dynamic traffic splitting between **Stable (`v1`)** and **Canary (`v2`)** versions of `payment-service`:
+`payment-service` (NodePort 30004) points at **payment-router**, an NGINX
+deployment that splits traffic between two deployments:
+
+* **stable:** image `meshbank/payment-service:dev`, reports `v1`;
+* **canary:** image `meshbank/payment-service:v2`, built with
+  `--build-arg SERVICE_VERSION=v2`, reports `v2`.
+
+The version comes from the running application (`/health` and the
+`X-Service-Version` header), not from the proxy, so the split you measure is
+the release that actually answered. Both tracks run the same code today; to
+ship a real change, build the `v2` image from the changed code
+(`k8s/deploy.sh` shows the command) and shift traffic.
 
 ```
-                           Incoming Requests (NodePort 30004 or Mesh)
-                                              │
-                                              ▼
-                             ┌─────────────────────────────────┐
-                             │         payment-router          │
-                             │   (NGINX Traffic Controller)    │
-                             └────────────────┬────────────────┘
-                                              │
-                    ┌─────────────────────────┴────────────────────────┐
-   Header Override  │                                                  │  Header Override
-   X-Canary: never  │ Default Split (e.g. 80% / 20%)                   │  X-Canary: always
-                    ▼                                                  ▼
-      ┌───────────────────────────┐                      ┌───────────────────────────┐
-      │  payment-service-stable   │                      │  payment-service-canary   │
-      │       (Track: stable)     │                      │       (Track: canary)     │
-      │         Version: v1       │                      │         Version: v2       │
-      │                           │                      │                           │
-      │  [mesh-sidecar] Port 8443 │                      │  [mesh-sidecar] Port 8443 │
-      │  [payment-app]  Port 8080 │                      │  [payment-app]  Port 8080 │
-      └─────────────┬─────────────┘                      └─────────────┬─────────────┘
-                    │                                                  │
-                    └───────────────── mTLS (Port 8443) ───────────────┘
-                                              │
-                                              ▼
-                                 ┌───────────────────────────┐
-                                 │    transaction-service    │
-                                 └───────────────────────────┘
+            NodePort 30004
+                  │
+          ┌───────▼────────┐   X-Canary: always → canary
+          │ payment-router │   X-Canary: never  → stable
+          └───┬────────┬───┘   otherwise weighted (default 80/20)
+              │        │
+     payment-service-stable   payment-service-canary
+        (v1 + sidecar)           (v2 + sidecar)
+              └──── mTLS to account / transaction / fraud / notification
 ```
 
-### 17.2 Capabilities & Controls
+Response headers: `X-Service-Version` (from the app), `X-Mesh-Track` (from the
+sidecar), `X-Mesh-Router` (from the router). CORS is answered by the app only.
 
-1. **Dynamic Weighted Traffic Splitting:**
-   * Split ratio can be updated on-the-fly without restarting pods or losing connections (e.g., 90/10, 50/50, 0/100, 100/0).
-   * Responses carry track and version headers for transparency:
-     * `X-Mesh-Track: stable` vs `canary`
-     * `X-Service-Version: v1` vs `v2`
-     * `X-Mesh-Router: payment-traffic-manager`
-2. **Header-based Routing (A/B Testing Overrides):**
-   * `X-Canary: always` routes 100% of requests to the Canary deployment regardless of weights.
-   * `X-Canary: never` routes 100% of requests to the Stable deployment.
-3. **Health-based Rollout & Automatic Rollback:**
-   * Circuit-breaking and fail-over with `max_fails=2 fail_timeout=5s`.
-   * Automated rollback restores 100% stable traffic instantly if the canary deployment becomes degraded or unavailable.
+### 17.2 Commands
 
-### 17.3 Traffic Management Commands
-
-```powershell
-# Run the complete automated canary rollout lifecycle demo
-.\k8s\canary-traffic.ps1 -Command demo-rollout
-
-# Run the health failure & automatic rollback demonstration
-.\k8s\canary-traffic.ps1 -Command demo-rollback
-
-# Test header-based routing overrides (A/B testing)
-.\k8s\canary-traffic.ps1 -Command header
-
-# Dynamically set a specific split ratio (e.g. 70% stable, 30% canary)
-.\k8s\canary-traffic.ps1 -Command set-split -Stable 70 -Canary 30
-
-# Verify the actual live request distribution over 100 requests
-.\k8s\canary-traffic.ps1 -Command verify -Count 100
+```bash
+make k8s-canary-split STABLE=90 CANARY=10    # applies the weights, restarts the router
+make k8s-canary-demo                         # 90/10 → 50/50 → 0/100 → 100/0, measuring each
+.venv/bin/python k8s/canary-traffic.py --verify 200      # measure the live split
+.venv/bin/python k8s/canary-traffic.py --test-header     # X-Canary overrides
+.venv/bin/python k8s/canary-traffic.py --demo-rollback   # canary failure → 100% stable
 ```
 
-### 17.4 Actual Live Test Results
+A weight of 0 marks that backend `down`. A new split is applied by restarting
+the router (a rolling restart; NGINX reads its config only at start). The
+committed `k8s/mesh-router-config.yaml` keeps the 80/20 default; splits are
+applied to the cluster, not written back to the file. The dashboard's release
+buttons call the same script through the Vite dev server, which accepts
+integer weights only, from the dashboard's own origin.
 
-```text
-======================================================================
-  STAGE 1: CANARY ACTIVATION (90% STABLE / 10% CANARY)
-======================================================================
-  Total Requests:  100
-  Successful:      100 | Failed: 0
-  Stable (v1):      90 hits ( 90.0%)
-  Canary (v2):      10 hits ( 10.0%)
+---
 
-======================================================================
-  STAGE 2: TRAFFIC SPLIT RAMP-UP (50% STABLE / 50% CANARY)
-======================================================================
-  Total Requests:  100
-  Successful:      100 | Failed: 0
-  Stable (v1):      50 hits ( 50.0%)
-  Canary (v2):      50 hits ( 50.0%)
+## 18. Two-cluster mesh (AWS / GCP simulation)
 
-======================================================================
-  STAGE 3: FULL PROMOTION (0% STABLE / 100% CANARY)
-======================================================================
-  Total Requests:  100
-  Successful:      100 | Failed: 0
-  Stable (v1):       0 hits (  0.0%)
-  Canary (v2):     100 hits (100.0%)
+`make k8s-multi-up` runs the same services across two local kind clusters.
+They are named after two clouds, but both are Docker containers on your
+machine.
 
-======================================================================
-  STAGE 4: AUTOMATED ROLLBACK TO STABLE (100% STABLE / 0% CANARY)
-======================================================================
-  Total Requests:  100
-  Successful:      100 | Failed: 0
-  Stable (v1):     100 hits (100.0%)
-  Canary (v2):       0 hits (  0.0%)
+| Cluster (kubectl context) | Simulates | Runs | Host ports |
+|---|---|---|---|
+| `kind-meshbank-aws` | AWS | auth, account, transaction, PostgreSQL, gateway | 30001-30003, gateway 31443 |
+| `kind-meshbank-gcp` | GCP | payment (stable + canary + router), fraud, notification, PostgreSQL, gateway | 30004-30006, gateway 32443 |
 
-[Header-based Routing Overrides]
-  [PASS] X-Canary: always -> canary (v2)
-  [PASS] X-Canary: never  -> stable (v1)
+Every customer flow crosses clusters: a transfer runs in "AWS" and its saga
+calls fraud and notification in "GCP"; a payment runs in "GCP" and debits an
+account in "AWS". Pod and service address ranges do not overlap
+(`10.10/16`, `10.11/16` vs `10.20/16`, `10.21/16`).
+
+### How a cross-cluster call works
+
+```
+ kind-meshbank-gcp                                       kind-meshbank-aws
+ payment app ─http─▶ 127.0.0.1:9002 (own sidecar)
+                     mTLS, client cert payment-service,
+                     SNI account-service.meshbank.svc.cluster.local
+                       │
+                       ▼ aws-gateway alias Service ──▶ node :30443 ──▶ east-west gateway
+                                                                     reads SNI only,
+                                                                     forwards still-encrypted
+                                                                       │
+                                                                       ▼
+                                                        account sidecar :8443
+                                                        verifies cert + caller allow-list
 ```
 
+* **mTLS stays end to end.** The gateway uses `ssl_preread`: it reads the
+  server name from the TLS ClientHello and forwards the encrypted bytes. It
+  holds no keys and cannot read or alter the traffic. The receiving sidecar
+  authenticates and authorizes the caller exactly as it does in one cluster.
+* **Gateways route only exported services:** the ones the other cluster is
+  authorized to call (account and transaction from AWS; fraud and
+  notification from GCP). Any other name is refused at the gateway.
+* **Sidecar configs contain no addresses.** A sidecar calls the alias Service
+  `<cluster>-gateway`. The deploy script points that alias, through an
+  EndpointSlice, at the other cluster's node. On real clouds the alias would
+  point at a load balancer instead.
+* **One CA, separate keys.** Both clusters trust the same mesh CA, but each
+  cluster receives only its own workloads' private keys.
+* **No hardcoded DNS.** Proxies take their resolver from the pod's
+  `/etc/resolv.conf` at start, so the same configs work on kind, EKS and GKE.
+
+The placement (`cluster=` in [`scripts/mesh_topology.py`](scripts/mesh_topology.py))
+drives everything: `make mesh-configs` regenerates the per-mode sidecar
+configs and the gateways, and `scripts/cluster_manifests.py` selects each
+cluster's objects at deploy time.
+
+### Running it
+
+The single cluster and the two clusters use the same host ports, so run one
+at a time (the deploy scripts refuse to start otherwise).
+
+```bash
+make k8s-down                    # if the single cluster is running
+make k8s-multi-up                # build, create both clusters, deploy
+make k8s-multi-status            # nodes are labelled with the cloud they simulate
+make k8s-multi-test              # smoke test; transfers and payments cross clusters
+make k8s-multi-mtls-test         # adds gateway attacks and cross-cluster log checks
+make k8s-multi-canary-demo       # canary runs in the gcp cluster
+make frontend MESHBANK_TOPOLOGY=multi
+make k8s-multi-down
+```
+
+Two kind clusters need roughly 6 GB of Docker memory and several GB of disk.
+Linux and macOS only (the Windows `deploy.ps1` covers the single cluster).
 

@@ -81,6 +81,9 @@ class BaseServiceSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     service_name: str = "meshbank-service"
+    # Release identity, baked into the image at build time (SERVICE_VERSION build
+    # arg) and reported in /health and the X-Service-Version response header.
+    service_version: str = Field(default="v1", pattern=r"^v[0-9]+$")
     app_env: AppEnv = AppEnv.DEVELOPMENT
     log_level: str = Field(default="INFO", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     database_url: str = "sqlite:///./data/service.db"

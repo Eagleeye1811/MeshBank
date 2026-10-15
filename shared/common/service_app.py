@@ -75,19 +75,39 @@ def create_service_app(
         base=base,
         db=db,
     )
+    # Customers authenticate with bearer tokens, not cookies, so credentials are
+    # not needed. The mesh headers are added by the sidecar/router; exposing them
+    # here keeps CORS headers single-sourced (the proxies add none of their own).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "X-Service-Version",
+            "X-Mesh-Track",
+            "X-Mesh-Router",
+            "Idempotent-Replayed",
+        ],
     )
     app.add_middleware(RequestContextMiddleware)
+
+    @app.middleware("http")
+    async def release_version_header(request, call_next):
+        response = await call_next(request)
+        response.headers["X-Service-Version"] = settings.service_version
+        return response
+
     install_error_handlers(app)
 
     @app.get("/health", tags=["operations"], summary="Liveness: the process is running")
     def health() -> dict[str, str]:
-        return {"status": "ok", "service": settings.service_name}
+        return {
+            "status": "ok",
+            "service": settings.service_name,
+            "version": settings.service_version,
+        }
 
     @app.get("/ready", tags=["operations"], summary="Readiness: dependencies owned by this service")
     def ready() -> JSONResponse:

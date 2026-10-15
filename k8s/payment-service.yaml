@@ -6,6 +6,7 @@ metadata:
   name: payment-service
   namespace: meshbank
   labels:
+    meshbank.io/workload: payment-service
     app: payment-service-backend
     track: stable
     version: "1"
@@ -48,18 +49,10 @@ spec:
           env:
             - name: DATABASE_URL
               value: "postgresql+psycopg://payment_svc:meshbank_payment_dev@postgres:5432/meshbank_payment"
-            # Route transaction service calls through the local egress sidecar proxy (127.0.0.1:9003)
-            # The sidecar wraps requests with mTLS and payment-service's client certificate
-            - name: TRANSACTION_SERVICE_URL
-              value: "http://127.0.0.1:9003"
             - name: PAYMENT_PROVIDER_DECLINE_PREFIX
               value: "DECLINE"
             - name: PAYMENT_PROVIDER_MAX_AMOUNT
               value: "100000.00"
-            - name: SERVICE_TRACK
-              value: "stable"
-            - name: SERVICE_VERSION
-              value: "v1"
             - name: INTERNAL_API_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -106,6 +99,13 @@ spec:
         - name: mesh-sidecar
           image: nginx:alpine
           imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              ns=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+              && sed "s/__KUBE_DNS__/$ns/g" /etc/mesh/config/nginx.conf > /tmp/nginx.conf
+              && exec nginx -c /tmp/nginx.conf -g 'daemon off;'
           ports:
             - name: http
               containerPort: 8004
@@ -115,8 +115,8 @@ spec:
               containerPort: 9102
           volumeMounts:
             - name: sidecar-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
+              mountPath: /etc/mesh/config
+              readOnly: true
             - name: mesh-certs
               mountPath: /etc/mesh/certs
               readOnly: true
@@ -171,6 +171,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: payment-service
+  labels:
+    meshbank.io/workload: payment-service
   namespace: meshbank
 spec:
   selector:

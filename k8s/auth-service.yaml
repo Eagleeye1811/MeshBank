@@ -1,3 +1,5 @@
+# Service mesh: the app listens on 127.0.0.1:8080; the mesh-sidecar container
+# serves the public port, mTLS on 8443 and metrics on 9102.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -5,8 +7,9 @@ metadata:
   name: auth-service
   namespace: meshbank
   labels:
+    meshbank.io/workload: auth-service
     app: auth-service
-    version: "1"
+    version: '1'
 spec:
   replicas: 1
   selector:
@@ -21,7 +24,8 @@ spec:
     metadata:
       labels:
         app: auth-service
-        version: "1"
+        version: '1'
+        meshbank-sidecar: enabled
     spec:
       securityContext:
         runAsNonRoot: true
@@ -29,88 +33,169 @@ spec:
         runAsGroup: 10001
         fsGroup: 10001
       containers:
-        - name: auth-service
-          image: meshbank/auth-service:dev
-          imagePullPolicy: Never   # loaded via `kind load docker-image`
-          ports:
-            - name: http
-              containerPort: 8001
-          envFrom:
-            - configMapRef:
-                name: meshbank-common
-          env:
-            - name: DATABASE_URL
-              value: "postgresql+psycopg://auth_svc:meshbank_auth_dev@postgres:5432/meshbank_auth"
-            - name: JWT_SIGNING_KEY_ID
-              value: "dev-local-1"
-            - name: JWT_PRIVATE_KEY_FILE
-              value: "/run/secrets/jwt-signing-key/dev-local-1.pem"
-            - name: ACCESS_TOKEN_TTL_SECONDS
-              value: "900"
-            - name: INTERNAL_API_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: internal-api-token
-                  key: token
-          volumeMounts:
-            - name: jwt-public-keys
-              mountPath: /run/meshbank/jwt-public
-              readOnly: true
-            - name: jwt-signing-key
-              mountPath: /run/secrets/jwt-signing-key
-              readOnly: true
-            - name: tmp
-              mountPath: /tmp
-            - name: data
-              mountPath: /data
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 1000m
-              memory: 512Mi
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8001
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 6
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8001
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 3
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: [ALL]
-      volumes:
+      - name: auth-service
+        image: meshbank/auth-service:dev
+        imagePullPolicy: Never
+        ports:
+        - name: loopback
+          containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: meshbank-common
+        env:
+        - name: DATABASE_URL
+          value: postgresql+psycopg://auth_svc:meshbank_auth_dev@postgres:5432/meshbank_auth
+        - name: JWT_SIGNING_KEY_ID
+          value: dev-local-1
+        - name: JWT_PRIVATE_KEY_FILE
+          value: /run/secrets/jwt-signing-key/dev-local-1.pem
+        - name: ACCESS_TOKEN_TTL_SECONDS
+          value: '900'
+        - name: INTERNAL_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: internal-api-token
+              key: token
+        volumeMounts:
         - name: jwt-public-keys
-          secret:
-            secretName: jwt-public-keys
+          mountPath: /run/meshbank/jwt-public
+          readOnly: true
         - name: jwt-signing-key
-          secret:
-            secretName: jwt-signing-key
-            defaultMode: 0440
+          mountPath: /run/secrets/jwt-signing-key
+          readOnly: true
         - name: tmp
-          emptyDir: {}
+          mountPath: /tmp
         - name: data
-          emptyDir: {}
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        args:
+        - uvicorn
+        - --factory
+        - app.main:create_app
+        - --host
+        - 127.0.0.1
+        - --port
+        - '8080'
+        - --no-access-log
+      - name: mesh-sidecar
+        image: nginx:alpine
+        imagePullPolicy: Never
+        command:
+          - /bin/sh
+          - -c
+          - >-
+            ns=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+            && sed "s/__KUBE_DNS__/$ns/g" /etc/mesh/config/nginx.conf > /tmp/nginx.conf
+            && exec nginx -c /tmp/nginx.conf -g 'daemon off;'
+        ports:
+        - name: http
+          containerPort: 8001
+        - name: mesh-mtls
+          containerPort: 8443
+        - name: metrics
+          containerPort: 9102
+        volumeMounts:
+        - name: sidecar-config
+          mountPath: /etc/mesh/config
+          readOnly: true
+        - name: mesh-certs
+          mountPath: /etc/mesh/certs
+          readOnly: true
+        - name: sidecar-tmp
+          mountPath: /tmp
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9102
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9102
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: jwt-public-keys
+        secret:
+          secretName: jwt-public-keys
+      - name: jwt-signing-key
+        secret:
+          secretName: jwt-signing-key
+          defaultMode: 0440
+      - name: tmp
+        emptyDir: {}
+      - name: data
+        emptyDir: {}
+      - name: sidecar-config
+        configMap:
+          name: auth-sidecar-config
+      - name: mesh-certs
+        secret:
+          secretName: auth-mesh-certs
+          defaultMode: 0440
+      - name: sidecar-tmp
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: auth-service
+  labels:
+    meshbank.io/workload: auth-service
   namespace: meshbank
 spec:
   selector:
     app: auth-service
   ports:
-    - name: http
-      port: 8001
-      targetPort: 8001
+  - name: http
+    port: 8001
+    targetPort: 8001
+  - name: mesh-mtls
+    port: 8443
+    targetPort: 8443
+  - name: metrics
+    port: 9102
+    targetPort: 9102

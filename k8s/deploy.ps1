@@ -29,6 +29,8 @@ param (
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Make failing native commands (kind, kubectl, docker) stop the script (PowerShell 7.3+).
+$PSNativeCommandUseErrorActionPreference = $true
 
 $ROOT = Split-Path -Parent $PSScriptRoot
 Push-Location $ROOT
@@ -54,6 +56,8 @@ if (-not (Test-Path $pubKey) -or -not (Test-Path $privKey)) {
 if (-not $SkipBuild) {
     Write-Host "`n[1/7] Building Docker images..." -ForegroundColor Cyan
     docker compose build --quiet
+    # The canary is a separate release artifact that reports version v2.
+    docker build --quiet -f services/payment-service/Dockerfile --build-arg SERVICE_VERSION=v2 -t meshbank/payment-service:v2 .
 } else {
     Write-Host "`n[1/7] Skipping image build (--SkipBuild set)" -ForegroundColor Gray
 }
@@ -70,9 +74,17 @@ kubectl config use-context kind-meshbank
 
 # ── 4. Load images into kind ──────────────────────────────────────────────────
 Write-Host "`n[3/7] Loading Docker images into kind cluster..." -ForegroundColor Cyan
+foreach ($img in @("postgres:15-alpine", "nginx:alpine")) {
+    $PSNativeCommandUseErrorActionPreference = $false   # probe: failure is expected
+    docker image inspect $img *> $null
+    $missing = $LASTEXITCODE -ne 0
+    $PSNativeCommandUseErrorActionPreference = $true
+    if ($missing) { docker pull --quiet $img }
+}
 $images = @(
     "postgres:15-alpine",
     "nginx:alpine",
+    "meshbank/payment-service:v2",
     "meshbank/auth-service:dev",
     "meshbank/account-service:dev",
     "meshbank/transaction-service:dev",
@@ -87,7 +99,18 @@ foreach ($img in $images) {
 
 # ── 5. Generate Service Mesh mTLS Certificates & Configs ──────────────────────
 Write-Host "`n[4/7] Generating Mesh CA, Workload certs, and applying configs..." -ForegroundColor Cyan
-.\.venv\Scripts\python.exe scripts\generate_mesh_certs.py
+Push-Location scripts
+..\.venv\Scripts\python.exe generate_mesh_certs.py
+..\.venv\Scripts\python.exe generate_mesh_sidecars.py --check
+Pop-Location
+$existingDeployments = @()
+$PSNativeCommandUseErrorActionPreference = $false   # probe: failure is expected
+foreach ($d in @("auth-service", "account-service", "transaction-service", "payment-service",
+                 "payment-service-canary", "fraud-service", "notification-service", "payment-router")) {
+    kubectl get deployment $d -n meshbank *> $null
+    if ($LASTEXITCODE -eq 0) { $existingDeployments += $d }
+}
+$PSNativeCommandUseErrorActionPreference = $true
 kubectl apply -f k8s\namespace.yaml
 kubectl apply -f k8s\configmap.yaml
 kubectl apply -f k8s\secrets.yaml
@@ -102,6 +125,17 @@ kubectl create secret generic jwt-public-keys -n meshbank --from-file="dev-local
 
 Write-Host "  Creating/updating secret 'jwt-signing-key' from $privKey..."
 kubectl create secret generic jwt-signing-key -n meshbank --from-file="dev-local-1.pem=$privKey" --dry-run=client -o yaml | kubectl apply -f -
+
+# Objects from earlier versions of these manifests.
+kubectl delete networkpolicy mesh-default-policy -n meshbank --ignore-not-found
+kubectl delete secret mesh-ca-cert -n meshbank --ignore-not-found
+$PSNativeCommandUseErrorActionPreference = $false
+$selector = kubectl get deployment payment-service -n meshbank -o jsonpath='{.spec.selector.matchLabels.app}' 2>$null
+$PSNativeCommandUseErrorActionPreference = $true
+if ($selector -eq "payment-service") {
+    Write-Host "  Replacing payment-service deployment (selector changed; selectors are immutable)"
+    kubectl delete deployment payment-service -n meshbank --wait=true
+}
 
 # ── 6. Deploy PostgreSQL, wait for ready ──────────────────────────────────────
 Write-Host "`n[5/7] Deploying PostgreSQL..." -ForegroundColor Cyan
@@ -118,6 +152,8 @@ kubectl apply -f k8s\transaction-service.yaml
 kubectl apply -f k8s\payment-service.yaml
 kubectl apply -f k8s\payment-canary.yaml
 kubectl apply -f k8s\nodeports.yaml
+# Fixed image tags and subPath configs are only read at container start.
+foreach ($d in $existingDeployments) { kubectl rollout restart deployment/$d -n meshbank }
 
 # Wait for all deployments
 Write-Host "`n[7/7] Waiting for all deployments to be ready (up to 3 min)..." -ForegroundColor Cyan

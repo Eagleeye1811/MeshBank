@@ -6,6 +6,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: auth-nodeport
+  labels:
+    meshbank.io/workload: auth-service
   namespace: meshbank
 spec:
   type: NodePort
@@ -20,6 +22,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: account-nodeport
+  labels:
+    meshbank.io/workload: account-service
   namespace: meshbank
 spec:
   type: NodePort
@@ -34,6 +38,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: transaction-nodeport
+  labels:
+    meshbank.io/workload: transaction-service
   namespace: meshbank
 spec:
   type: NodePort
@@ -48,6 +54,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: payment-nodeport
+  labels:
+    meshbank.io/workload: payment-service
   namespace: meshbank
 spec:
   type: NodePort
@@ -62,6 +70,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fraud-nodeport
+  labels:
+    meshbank.io/workload: fraud-service
   namespace: meshbank
 spec:
   type: NodePort
@@ -76,6 +86,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: notification-nodeport
+  labels:
+    meshbank.io/workload: notification-service
   namespace: meshbank
 spec:
   type: NodePort

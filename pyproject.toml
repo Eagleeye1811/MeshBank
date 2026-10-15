@@ -17,6 +17,7 @@ ignore = [
 "tests/**" = ["S101", "S105", "S106", "S603"]
 "shared/common/testing.py" = ["S101", "S608"]
 "scripts/**" = ["S105", "T201", "S603", "S607"]  # fixed tool commands
+"k8s/*.py" = ["S101", "S603", "S607", "T201"]  # cluster test/ops scripts: fixed kubectl commands
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "common", "tests"]

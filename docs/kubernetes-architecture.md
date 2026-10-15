@@ -1,6 +1,10 @@
 # MeshBank Kubernetes architecture (Phase 2D–2G plan)
 
-Status: **plan only.** No cluster has been created. Nothing below may be
+Status: the two-cluster layout below is **implemented locally** with kind
+(`make k8s-multi-up`, README section 18). Differences from this plan: the
+east-west gateway is NGINX TLS passthrough (`ssl_preread`), not Envoy, and the
+remote-service aliases are one `<cluster>-gateway` Service per remote cluster,
+with SNI selecting the service. Real EKS/GKE deployment is not implemented. Nothing below may be
 executed until `make preflight PREFLIGHT_ARGS="--profile kind"` passes: Docker
 Engine reachable, `kind` installed, and at least 20 GiB free on the host disk.
 

@@ -26,6 +26,10 @@ COPY services/payment-service/migrations /srv/migrations
 RUN mkdir -p /data && chown meshbank:meshbank /data
 
 USER meshbank
+# Release identity reported by /health and X-Service-Version. The canary image
+# is built with --build-arg SERVICE_VERSION=v2 (see k8s/deploy.sh).
+ARG SERVICE_VERSION=v1
+ENV SERVICE_VERSION=${SERVICE_VERSION}
 ENV DATABASE_URL=sqlite:////data/payments.db
 VOLUME ["/data"]
 EXPOSE 8004

@@ -13,8 +13,10 @@ data:
   JWT_AUDIENCE: "meshbank-api"
   HTTP_TIMEOUT_SECONDS: "5"
   DB_MIGRATION_MODE: "upgrade"
-  ACCOUNT_SERVICE_URL: "http://account-service:8002"
-  TRANSACTION_SERVICE_URL: "http://transaction-service:8003"
-  FRAUD_SERVICE_URL: "http://fraud-service:8005"
-  NOTIFICATION_SERVICE_URL: "http://notification-service:8006"
+  # Service-to-service calls go to the caller's own sidecar on loopback, which
+  # opens mutual TLS to the target's sidecar (see scripts/mesh_topology.py).
+  ACCOUNT_SERVICE_URL: "http://127.0.0.1:9002"
+  TRANSACTION_SERVICE_URL: "http://127.0.0.1:9003"
+  FRAUD_SERVICE_URL: "http://127.0.0.1:9005"
+  NOTIFICATION_SERVICE_URL: "http://127.0.0.1:9006"
   RECOVERY_INTERVAL_SECONDS: "30"

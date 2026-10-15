@@ -1,70 +1,88 @@
 #!/usr/bin/env python3
-"""MeshBank Service Mesh Certificate and Workload Identity (mTLS) Generator.
+"""MeshBank service mesh certificates (mTLS workload identities).
 
-Generates:
-1. Mesh Root CA
-2. Workload certificate for payment-service (with SPIFFE SAN URI)
-3. Workload certificate for transaction-service (with SPIFFE SAN URI)
-4. Rogue CA and attacker client certificate for mTLS rejection tests
-5. Kubernetes secret manifest k8s/mesh-certs.yaml for zero-friction cluster deployment
+Creates, under k8s/certs/ (git-ignored):
+1. The mesh root CA.
+2. One workload certificate per service in ``mesh_topology.WORKLOADS``. The
+   subject CN is the service's cluster DNS name, which the sidecars authorize
+   on; the SPIFFE ID is carried as a URI SAN.
+3. A rogue CA and an attacker certificate, used by k8s/test-mesh-mtls.py to
+   prove that untrusted certificates are rejected.
+4. k8s/mesh-certs.yaml (git-ignored): one Kubernetes Secret per workload.
+
+Existing material is reused, so re-running a deploy does not rotate the CA
+under running pods. A workload certificate is reissued only when it is missing,
+not signed by the current CA, or expires within 14 days. ``--rotate`` replaces
+everything (then restart the meshed deployments; deploy.sh does this).
 """
 
 from __future__ import annotations
 
-import datetime
-from pathlib import Path
-import ipaddress
+import argparse
 import base64
+import datetime
+import ipaddress
+from collections.abc import Callable
+from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from mesh_topology import NAMESPACE, WORKLOADS, Workload
 
-CERTS_DIR = Path(__file__).resolve().parents[1] / "k8s" / "certs"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+CERTS_DIR = ROOT_DIR / "k8s" / "certs"
+MANIFEST_PATH = ROOT_DIR / "k8s" / "mesh-certs.yaml"
+RENEW_BEFORE = datetime.timedelta(days=14)
+
+
+def now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
 
 
 def generate_key() -> rsa.RSAPrivateKey:
-    return rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend(),
-    )
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-def serialize_key(key: rsa.RSAPrivateKey) -> str:
+def key_pem(key: rsa.RSAPrivateKey) -> str:
     return key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
         encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
+    ).decode()
 
 
-def serialize_cert(cert: x509.Certificate) -> str:
-    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+def cert_pem(cert: x509.Certificate) -> str:
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
 
 
-def create_ca(common_name: str, org: str = "MeshBank") -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+def write_private(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+
+
+def create_ca(
+    common_name: str, org: str = "MeshBank"
+) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     key = generate_key()
-    subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, org),
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Mesh Security"),
-    ])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, org),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Mesh Security"),
+        ]
+    )
     cert = (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
+        .subject_name(name)
+        .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=5))
-        .not_valid_after(now + datetime.timedelta(days=365))
-        .add_extension(
-            x509.BasicConstraints(ca=True, path_length=None),
-            critical=True,
-        )
+        .not_valid_before(now() - datetime.timedelta(minutes=5))
+        .not_valid_after(now() + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -79,46 +97,39 @@ def create_ca(common_name: str, org: str = "MeshBank") -> tuple[rsa.RSAPrivateKe
             ),
             critical=True,
         )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256(), default_backend())
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
     )
     return key, cert
 
 
 def create_workload_cert(
-    service_name: str,
-    spiffe_uri: str,
+    common_name: str,
+    spiffe_id: str,
+    dns_names: list[str],
     ca_key: rsa.RSAPrivateKey,
     ca_cert: x509.Certificate,
-    dns_names: list[str],
 ) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     key = generate_key()
-    subject = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, f"{service_name}.meshbank.svc.cluster.local"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "MeshBank"),
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Mesh Workload"),
-    ])
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    san_items: list[x509.GeneralName] = [x509.DNSName(dns) for dns in dns_names]
-    san_items.append(x509.UniformResourceIdentifier(spiffe_uri))
-    san_items.append(x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")))
-
+    subject = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "MeshBank"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Mesh Workload"),
+        ]
+    )
+    sans: list[x509.GeneralName] = [x509.DNSName(d) for d in dns_names]
+    sans.append(x509.UniformResourceIdentifier(spiffe_id))
+    sans.append(x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")))
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(ca_cert.subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=5))
-        .not_valid_after(now + datetime.timedelta(days=90))
-        .add_extension(
-            x509.BasicConstraints(ca=False, path_length=None),
-            critical=True,
-        )
+        .not_valid_before(now() - datetime.timedelta(minutes=5))
+        .not_valid_after(now() + datetime.timedelta(days=90))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -134,140 +145,144 @@ def create_workload_cert(
             critical=True,
         )
         .add_extension(
-            x509.ExtendedKeyUsage([
-                x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
-                x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
-            ]),
+            x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]
+            ),
             critical=True,
         )
-        .add_extension(
-            x509.SubjectAlternativeName(san_items),
-            critical=False,
-        )
+        .add_extension(x509.SubjectAlternativeName(sans), critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
             critical=False,
         )
-        .sign(ca_key, hashes.SHA256(), default_backend())
+        .sign(ca_key, hashes.SHA256())
     )
     return key, cert
 
 
-def b64(data: str) -> str:
-    return base64.b64encode(data.encode("utf-8")).decode("utf-8")
+def load_pair(name: str) -> tuple[rsa.RSAPrivateKey, x509.Certificate] | None:
+    crt, key = CERTS_DIR / f"{name}.crt", CERTS_DIR / f"{name}.key"
+    if not (crt.exists() and key.exists()):
+        return None
+    private = serialization.load_pem_private_key(key.read_bytes(), password=None)
+    if not isinstance(private, rsa.RSAPrivateKey):
+        return None
+    return private, x509.load_pem_x509_certificate(crt.read_bytes())
 
 
-def main() -> None:
+def still_valid(cert: x509.Certificate, ca_cert: x509.Certificate) -> bool:
+    if cert.issuer != ca_cert.subject or cert.not_valid_after_utc - RENEW_BEFORE < now():
+        return False
+    ca_public = ca_cert.public_key()
+    if not isinstance(ca_public, rsa.RSAPublicKey) or cert.signature_hash_algorithm is None:
+        return False
+    try:
+        ca_public.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cert.signature_hash_algorithm,
+        )
+    except InvalidSignature:
+        return False
+    return True
+
+
+def ensure_pair(
+    name: str,
+    make: Callable[[], tuple[rsa.RSAPrivateKey, x509.Certificate]],
+    rotate: bool,
+    valid: Callable[[x509.Certificate], bool] = lambda _cert: True,
+) -> tuple[rsa.RSAPrivateKey, x509.Certificate, bool]:
+    existing = None if rotate else load_pair(name)
+    if existing and valid(existing[1]):
+        print(f"  [kept]   {name}")
+        return *existing, False
+    key, cert = make()
+    write_private(CERTS_DIR / f"{name}.key", key_pem(key))
+    (CERTS_DIR / f"{name}.crt").write_text(cert_pem(cert), encoding="utf-8")
+    print(f"  [issued] {name}")
+    return key, cert, True
+
+
+def workload_dns(w: Workload) -> list[str]:
+    return [w.name, f"{w.name}.{NAMESPACE}", f"{w.name}.{NAMESPACE}.svc", w.fqdn, "localhost"]
+
+
+def b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--rotate", action="store_true", help="replace the CA and every cert")
+    args = parser.parse_args()
+
     CERTS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Generating mesh certificates in {CERTS_DIR}...")
+    (CERTS_DIR / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+    print(f"Mesh certificates in {CERTS_DIR}")
 
-    # 1. Mesh Root CA
-    ca_key, ca_cert = create_ca("MeshBank Mesh Root CA")
-    ca_key_pem = serialize_key(ca_key)
-    ca_cert_pem = serialize_cert(ca_cert)
-    (CERTS_DIR / "ca.crt").write_text(ca_cert_pem, encoding="utf-8")
-    (CERTS_DIR / "ca.key").write_text(ca_key_pem, encoding="utf-8")
-    print("  [OK] Mesh Root CA created (ca.crt, ca.key)")
-
-    # 2. Payment service workload cert
-    pay_key, pay_cert = create_workload_cert(
-        service_name="payment-service",
-        spiffe_uri="spiffe://meshbank.internal/ns/meshbank/sa/payment-service",
-        ca_key=ca_key,
-        ca_cert=ca_cert,
-        dns_names=[
-            "payment-service",
-            "payment-service.meshbank",
-            "payment-service.meshbank.svc",
-            "payment-service.meshbank.svc.cluster.local",
-            "localhost",
-        ],
+    ca_key, ca_cert, ca_new = ensure_pair(
+        "ca",
+        lambda: create_ca("MeshBank Mesh Root CA"),
+        args.rotate,
+        valid=lambda c: c.not_valid_after_utc - RENEW_BEFORE > now(),
     )
-    pay_key_pem = serialize_key(pay_key)
-    pay_cert_pem = serialize_cert(pay_cert)
-    (CERTS_DIR / "payment-service.crt").write_text(pay_cert_pem, encoding="utf-8")
-    (CERTS_DIR / "payment-service.key").write_text(pay_key_pem, encoding="utf-8")
-    print("  [OK] payment-service workload certificate created with SPIFFE ID")
+    ca_text = cert_pem(ca_cert)
 
-    # 3. Transaction service workload cert
-    tx_key, tx_cert = create_workload_cert(
-        service_name="transaction-service",
-        spiffe_uri="spiffe://meshbank.internal/ns/meshbank/sa/transaction-service",
-        ca_key=ca_key,
-        ca_cert=ca_cert,
-        dns_names=[
-            "transaction-service",
-            "transaction-service.meshbank",
-            "transaction-service.meshbank.svc",
-            "transaction-service.meshbank.svc.cluster.local",
-            "localhost",
-        ],
-    )
-    tx_key_pem = serialize_key(tx_key)
-    tx_cert_pem = serialize_cert(tx_cert)
-    (CERTS_DIR / "transaction-service.crt").write_text(tx_cert_pem, encoding="utf-8")
-    (CERTS_DIR / "transaction-service.key").write_text(tx_key_pem, encoding="utf-8")
-    print("  [OK] transaction-service workload certificate created with SPIFFE ID")
-
-    # 4. Rogue / Untrusted CA & Attacker cert
-    rogue_key, rogue_ca_cert = create_ca("Untrusted Rogue Root CA", org="EvilCorp")
-    att_key, att_cert = create_workload_cert(
-        service_name="attacker-service",
-        spiffe_uri="spiffe://evilcorp.internal/ns/attacker/sa/attacker-service",
-        ca_key=rogue_key,
-        ca_cert=rogue_ca_cert,
-        dns_names=["attacker", "localhost"],
-    )
-    (CERTS_DIR / "rogue-ca.crt").write_text(serialize_cert(rogue_ca_cert), encoding="utf-8")
-    (CERTS_DIR / "attacker.crt").write_text(serialize_cert(att_cert), encoding="utf-8")
-    (CERTS_DIR / "attacker.key").write_text(serialize_key(att_key), encoding="utf-8")
-    print("  [OK] Untrusted attacker certificate created for rejection test")
-
-    # 5. Generate Kubernetes secret manifest
-    k8s_secret_manifest = f"""# Auto-generated by scripts/generate_mesh_certs.py
+    secrets = []
+    for w in WORKLOADS.values():
+        key, cert, _ = ensure_pair(
+            w.name,
+            lambda w=w: create_workload_cert(w.fqdn, w.spiffe_id, workload_dns(w), ca_key, ca_cert),
+            args.rotate or ca_new,
+            valid=lambda c: still_valid(c, ca_cert),
+        )
+        secrets.append(
+            f"""---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: mesh-ca-cert
-  namespace: meshbank
+  name: {w.cert_secret}
+  namespace: {NAMESPACE}
+  labels:
+    meshbank.io/workload: {w.name}
 type: Opaque
 data:
-  ca.crt: {b64(ca_cert_pem)}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: payment-mesh-certs
-  namespace: meshbank
-type: Opaque
-data:
-  tls.crt: {b64(pay_cert_pem)}
-  tls.key: {b64(pay_key_pem)}
-  ca.crt: {b64(ca_cert_pem)}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: transaction-mesh-certs
-  namespace: meshbank
-type: Opaque
-data:
-  tls.crt: {b64(tx_cert_pem)}
-  tls.key: {b64(tx_key_pem)}
-  ca.crt: {b64(ca_cert_pem)}
+  tls.crt: {b64(cert_pem(cert))}
+  tls.key: {b64(key_pem(key))}
+  ca.crt: {b64(ca_text)}
 """
-    manifest_path = Path(__file__).resolve().parents[1] / "k8s" / "mesh-certs.yaml"
-    manifest_path.write_text(k8s_secret_manifest, encoding="utf-8")
-    print(f"  [OK] Kubernetes mesh secrets written to {manifest_path}")
+        )
 
-    # Ensure k8s/certs is ignored by git
-    gitignore = CERTS_DIR / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
-        print("  [OK] Created .gitignore in certs directory to prevent committing private keys")
+    # Untrusted material for the negative tests.
+    rogue_key, rogue_ca, _ = ensure_pair(
+        "rogue-ca", lambda: create_ca("Untrusted Rogue Root CA", org="EvilCorp"), args.rotate
+    )
+    ensure_pair(
+        "attacker",
+        lambda: create_workload_cert(
+            # Claims a trusted service's name, but is signed by the wrong CA.
+            WORKLOADS["payment-service"].fqdn,
+            "spiffe://evilcorp.internal/ns/attacker/sa/attacker-service",
+            ["attacker", "localhost"],
+            rogue_key,
+            rogue_ca,
+        ),
+        args.rotate,
+    )
 
-    print("\nCertificate generation completed successfully.")
+    MANIFEST_PATH.write_text(
+        "# Generated by scripts/generate_mesh_certs.py. Contains private keys: never commit.\n"
+        + "".join(secrets),
+        encoding="utf-8",
+    )
+    MANIFEST_PATH.chmod(0o600)
+    print(f"  [OK] {MANIFEST_PATH.relative_to(ROOT_DIR)} ({len(secrets)} workload secrets)")
+    if ca_new:
+        print("  NOTE: new CA issued; restart meshed pods so every sidecar trusts it.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

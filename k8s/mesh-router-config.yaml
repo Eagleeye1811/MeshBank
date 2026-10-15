@@ -2,6 +2,8 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: payment-router-config
+  labels:
+    meshbank.io/workload: payment-service
   namespace: meshbank
 data:
   nginx.conf: |
@@ -19,7 +21,7 @@ data:
         uwsgi_temp_path       /tmp/uwsgi_temp;
         scgi_temp_path        /tmp/scgi_temp;
 
-        resolver 10.96.0.10 valid=10s ipv6=off;
+        resolver __KUBE_DNS__ valid=10s ipv6=off;
 
         log_format router_json escape=json '{'
           '"time":"$time_iso8601",'
@@ -46,7 +48,8 @@ data:
             server payment-service-canary.meshbank.svc.cluster.local:8004 max_fails=2 fail_timeout=5s;
         }
 
-        # 3. Dynamic Weighted Split Upstream
+        # 3. Dynamic Weighted Split Upstream (k8s/canary-traffic.py --set-split rewrites
+        #    the two server lines below; keep their format)
         upstream payment_weighted_upstream {
             server payment-service-stable.meshbank.svc.cluster.local:8004 weight=80 max_fails=2 fail_timeout=5s;
             server payment-service-canary.meshbank.svc.cluster.local:8004 weight=20 max_fails=2 fail_timeout=5s;
@@ -63,21 +66,13 @@ data:
             listen 8004;
             server_name _;
 
+            # CORS (including preflight) is answered by the payment service itself;
+            # adding CORS headers here too would duplicate them and browsers reject that.
             location / {
-                if ($request_method = 'OPTIONS') {
-                    add_header Access-Control-Allow-Origin "*" always;
-                    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS, PUT, DELETE" always;
-                    add_header Access-Control-Allow-Headers "*" always;
-                    return 204;
-                }
-
                 proxy_pass http://$target_upstream;
                 proxy_set_header Host $host;
                 proxy_set_header X-Real-IP $remote_addr;
                 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                
-                add_header Access-Control-Allow-Origin "*" always;
-                add_header Access-Control-Expose-Headers "X-Mesh-Track, X-Service-Version, X-Mesh-Router, Idempotent-Replayed" always;
                 add_header X-Mesh-Router "payment-traffic-manager" always;
             }
         }
@@ -92,7 +87,6 @@ data:
 
             location /health {
                 default_type application/json;
-                add_header Access-Control-Allow-Origin "*" always;
                 return 200 '{"status":"ok","router":"payment-traffic-manager","target":"$target_upstream"}\n';
             }
         }

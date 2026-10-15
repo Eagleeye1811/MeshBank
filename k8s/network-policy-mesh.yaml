@@ -1,11 +1,22 @@
----
-# Kubernetes NetworkPolicy for MeshBank Service Mesh.
-# Restricts inter-service communication so only authorized mesh mTLS traffic (port 8443)
-# and necessary infrastructure traffic (PostgreSQL, DNS) can flow.
+# NetworkPolicies for the MeshBank service mesh.
+#
+# Layer 4 (here) and layer 7 (the sidecars) together:
+# * Apps listen only on 127.0.0.1:8080, so nothing outside the pod reaches them
+#   except through the sidecar.
+# * mTLS port 8443 accepts connections only from other meshed pods and, in the
+#   multi-cluster setup, the east-west gateway (which forwards the other
+#   cluster's still-encrypted mTLS). The sidecar then requires a mesh-CA
+#   certificate and an authorized caller identity.
+# * Public ports stay open (NodePort, payment router, kubelet probes); the
+#   sidecars refuse internal endpoints there with 403 MTLS_REQUIRED.
+# * PostgreSQL accepts connections only from meshed application pods.
+#
+# Enforcement needs a CNI with NetworkPolicy support: kind >= v0.24 (kindnet)
+# enforces it; older kind versions silently ignore these objects.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mesh-default-policy
+  name: mesh-workloads
   namespace: meshbank
 spec:
   podSelector:
@@ -14,21 +25,49 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # 1. Allow mTLS mesh traffic on port 8443 from any pod in meshbank namespace
     - from:
-        - podSelector: {}
+        - podSelector:
+            matchLabels:
+              meshbank-sidecar: "enabled"
+        - podSelector:
+            matchLabels:
+              meshbank.io/gateway: "true"
       ports:
         - protocol: TCP
           port: 8443
-
-    # 2. Allow public HTTP traffic on ports 8003 & 8004 for external NodePort / Ingress / Smoke Tests
     - ports:
+        - protocol: TCP
+          port: 8001
+        - protocol: TCP
+          port: 8002
         - protocol: TCP
           port: 8003
         - protocol: TCP
           port: 8004
-
-    # 3. Allow metrics scraping on port 9102
-    - ports:
+        - protocol: TCP
+          port: 8005
+        - protocol: TCP
+          port: 8006
+        # Sidecar health (kubelet probes) and stub_status metrics.
         - protocol: TCP
           port: 9102
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-mesh-only
+  namespace: meshbank
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              meshbank-sidecar: "enabled"
+      ports:
+        - protocol: TCP
+          port: 5432

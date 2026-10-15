@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""MeshBank Service Mesh Verification and Security Test Suite.
+"""MeshBank service mesh security tests (run against the kind cluster).
 
-Proves:
-1. Workload mutual TLS (mTLS) authentication between payment and transaction services.
-2. Strict rejection of connections with missing client certificates (HTTP 400 SSL No Cert).
-3. Strict rejection of connections with untrusted/attacker certificates (HTTP 400 SSL Error).
-4. Strict rejection of plaintext bypass attempts for internal service endpoints (HTTP 403 MTLS_REQUIRED).
-5. In-cluster sidecar mediation for complete banking payment workflows.
-6. Extraction and verification of structured sidecar proxy access logs and metrics.
+Proves, for every meshed service:
+1. Internal endpoints on the public plaintext port return 403 MTLS_REQUIRED.
+2. The mTLS port rejects a client without a certificate.
+3. The mTLS port rejects a certificate from an untrusted CA, even one that
+   claims a trusted service's name.
+4. A trusted certificate whose identity is not an authorized caller gets 403
+   IDENTITY_NOT_AUTHORIZED.
+5. An authorized caller's certificate succeeds.
+Then runs the banking smoke test (all hops mTLS) and checks the sidecar logs
+show verified, authorized mTLS callers on each receiving service.
+
+With MESHBANK_TOPOLOGY=multi it also attacks each cluster's east-west gateway
+from the host: only exported services are routable, and the receiving sidecar
+still rejects untrusted and unauthorized certificates that come through it.
+It also checks that cross-cluster callers show up in the receivers' logs.
+
+Usage: make k8s-mtls-test   |   make k8s-multi-mtls-test
 """
 
 from __future__ import annotations
 
 import json
-import os
 import socket
 import ssl
 import subprocess
@@ -25,240 +34,328 @@ import httpx
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CERTS_DIR = ROOT_DIR / "k8s" / "certs"
+sys.path.insert(0, str(ROOT_DIR / "scripts"))
+from mesh_topology import (  # noqa: E402
+    CLUSTERS,
+    MULTI,
+    WORKLOADS,
+    exported,
+    kube_context,
+    topology,
+)
 
-CA_CERT = str(CERTS_DIR / "ca.crt")
-PAYMENT_CERT = str(CERTS_DIR / "payment-service.crt")
-PAYMENT_KEY = str(CERTS_DIR / "payment-service.key")
-TRANSACTION_CERT = str(CERTS_DIR / "transaction-service.crt")
-TRANSACTION_KEY = str(CERTS_DIR / "transaction-service.key")
-ATTACKER_CERT = str(CERTS_DIR / "attacker.crt")
-ATTACKER_KEY = str(CERTS_DIR / "attacker.key")
+CA_CERT = CERTS_DIR / "ca.crt"
+ATTACKER = (CERTS_DIR / "attacker.crt", CERTS_DIR / "attacker.key")
+NODE_PORTS = {name: 30000 + w.public_port % 100 for name, w in WORKLOADS.items()}
 
-PASS_COUNT = 0
-FAIL_COUNT = 0
+# (service, method, path) that must never be served over plaintext.
+PLAINTEXT_PROBES = [
+    ("account-service", "GET", "/internal/accounts/00000000-0000-0000-0000-000000000000"),
+    ("account-service", "POST", "/internal/dev/accounts/00000000-0000-0000-0000-000000000000/seed"),
+    ("transaction-service", "POST", "/internal/payment-debits"),
+    ("payment-service", "POST", "/internal/recovery/run"),
+    ("fraud-service", "POST", "/evaluate"),
+    ("notification-service", "POST", "/notifications"),
+]
+
+# Gateway NodePort 30443 is mapped to these host ports (k8s/multicluster/kind-*.yaml).
+GATEWAY_HOST_PORTS = {"aws": 31443, "gcp": 32443}
+
+PASSED = 0
+FAILED = 0
 
 
-def report(test_name: str, passed: bool, details: str = "") -> None:
-    global PASS_COUNT, FAIL_COUNT
-    if passed:
-        PASS_COUNT += 1
-        print(f"  [PASS] {test_name}")
+def report(name: str, ok: bool, details: str = "") -> None:
+    global PASSED, FAILED
+    if ok:
+        PASSED += 1
     else:
-        FAIL_COUNT += 1
-        print(f"  [FAIL] {test_name}")
-    if details:
-        for line in details.strip().splitlines():
-            print(f"         {line}")
+        FAILED += 1
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    for line in details.strip().splitlines():
+        print(f"         {line}")
 
 
 def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     return res.returncode, res.stdout.strip(), res.stderr.strip()
 
 
-def send_raw_https(
-    port: int,
-    hostname: str,
-    path: str,
-    cafile: str,
-    certfile: str | None = None,
-    keyfile: str | None = None,
+def pair(service: str) -> tuple[Path, Path]:
+    return CERTS_DIR / f"{service}.crt", CERTS_DIR / f"{service}.key"
+
+
+def https_get(
+    port: int, hostname: str, path: str, cert: tuple[Path, Path] | None
 ) -> tuple[int | None, str]:
-    ctx = ssl.create_default_context(cafile=cafile)
-    if certfile and keyfile:
-        ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    """Raw HTTPS GET that verifies the server against the mesh CA."""
+    ctx = ssl.create_default_context(cafile=str(CA_CERT))
+    if cert:
+        ctx.load_cert_chain(certfile=str(cert[0]), keyfile=str(cert[1]))
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock:
-            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-                req = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
-                ssock.sendall(req.encode("utf-8"))
-                response_data = b""
-                while True:
-                    chunk = ssock.recv(4096)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                resp_text = response_data.decode("utf-8", errors="replace")
-                status = None
-                if resp_text.startswith("HTTP/"):
-                    parts = resp_text.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        status = int(parts[1])
-                return status, resp_text
-    except ssl.SSLError as exc:
-        return None, f"SSLError: {exc}"
-    except Exception as exc:
-        return None, f"ConnectionError: {exc}"
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=5.0) as sock,
+            ctx.wrap_socket(sock, server_hostname=hostname) as tls,
+        ):
+            tls.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n".encode()
+            )
+            data = b""
+            while chunk := tls.recv(4096):
+                data += chunk
+    except (ssl.SSLError, OSError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    text = data.decode(errors="replace")
+    parts = text.split(maxsplit=2)
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    return status, text
+
+
+def rejected_at_tls(status: int | None, body: str) -> bool:
+    """NGINX answers a missing/untrusted client cert with 400, or the handshake fails."""
+    return status is None or (status == 400 and "SSL certificate" in body)
+
+
+# payment-service's own Service points at the canary router (no 8443), so the
+# mTLS port is tested on the stable backend Service.
+MTLS_SERVICE = {"payment-service": "payment-service-stable"}
+
+
+class PortForward:
+    def __init__(self, service: str, local_port: int) -> None:
+        self.local_port = local_port
+        target = MTLS_SERVICE.get(service, service)
+        self.proc = subprocess.Popen(
+            [
+                "kubectl",
+                "--context",
+                kube_context(service),
+                "port-forward",
+                f"svc/{target}",
+                "-n",
+                "meshbank",
+                f"{local_port}:8443",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def __enter__(self) -> PortForward:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", self.local_port), timeout=1).close()
+                return self
+            except OSError:
+                time.sleep(0.3)
+        raise RuntimeError(f"port-forward to {self.local_port} did not come up")
+
+    def __exit__(self, *exc: object) -> None:
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def test_artifacts() -> bool:
+    print("\n--- 1. Certificate artifacts ---")
+    missing = [
+        p.name
+        for p in (CA_CERT, *ATTACKER, *(f for w in WORKLOADS for f in pair(w)))
+        if not p.exists()
+    ]
+    report("mesh CA, 6 workload certs and attacker cert exist", not missing, ", ".join(missing))
+    return not missing
+
+
+def test_plaintext_bypass() -> None:
+    print("\n--- 2. Plaintext bypass of internal endpoints (NodePorts) ---")
+    for service, method, path in PLAINTEXT_PROBES:
+        url = f"http://localhost:{NODE_PORTS[service]}{path}"
+        try:
+            r = httpx.request(method, url, json={}, timeout=5.0)
+            ok = r.status_code == 403 and "MTLS_REQUIRED" in r.text
+            detail = f"{r.status_code} {r.text.strip()[:120]}"
+        except httpx.HTTPError as exc:
+            ok, detail = False, str(exc)
+        report(f"{service}: {method} {path} over plaintext is refused", ok, detail)
+
+
+def test_mtls_port(service: str, local_port: int) -> None:
+    w = WORKLOADS[service]
+    unauthorized = next((s for s in WORKLOADS if s not in w.callers and s != service), None)
+    with PortForward(service, local_port):
+        status, body = https_get(local_port, w.fqdn, "/health", None)
+        report(
+            f"{service}: no client certificate is rejected",
+            rejected_at_tls(status, body),
+            body.splitlines()[0] if body else "",
+        )
+
+        status, body = https_get(local_port, w.fqdn, "/health", ATTACKER)
+        report(
+            f"{service}: untrusted-CA certificate is rejected",
+            rejected_at_tls(status, body),
+            body.splitlines()[0] if body else "",
+        )
+
+        if unauthorized:
+            status, body = https_get(local_port, w.fqdn, "/health", pair(unauthorized))
+            report(
+                f"{service}: trusted but unauthorized identity ({unauthorized}) gets 403",
+                status == 403 and "IDENTITY_NOT_AUTHORIZED" in body,
+                f"status {status}",
+            )
+
+        for caller in w.callers:
+            status, body = https_get(local_port, w.fqdn, "/health", pair(caller))
+            report(
+                f"{service}: authorized caller {caller} succeeds",
+                status == 200 and '"status":"ok"' in body,
+                f"status {status}",
+            )
+
+
+def test_sidecar_logs() -> None:
+    print("\n--- 5. Receiving sidecars logged verified, authorized mTLS callers ---")
+    for service, w in WORKLOADS.items():
+        if not w.callers:
+            continue
+        label = "app=payment-service-backend" if service == "payment-service" else f"app={service}"
+        _, logs, _ = run_cmd(
+            [
+                "kubectl",
+                "--context",
+                kube_context(service),
+                "logs",
+                "-l",
+                label,
+                "-c",
+                "mesh-sidecar",
+                "-n",
+                "meshbank",
+                "--tail=500",
+            ]
+        )
+        seen: dict[str, dict] = {}
+        for line in logs.splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                entry.get("server_port") == "8443"
+                and entry.get("ssl_client_verify") == "SUCCESS"
+                and entry.get("mesh_caller")
+                and entry.get("status", 999) < 400
+            ):
+                seen[entry["mesh_caller"]] = entry
+        sample = next(iter(seen.values()), {})
+        report(
+            f"{service}: mTLS traffic from {sorted(seen) or 'nobody'}",
+            bool(seen),
+            f"{sample.get('ssl_protocol')} {sample.get('ssl_cipher')}" if sample else "",
+        )
+        remote = sorted(c for c in seen if WORKLOADS[c].cluster != w.cluster)
+        if topology() == MULTI and any(WORKLOADS[c].cluster != w.cluster for c in w.callers):
+            report(
+                f"{service} ({w.cluster}): cross-cluster mTLS from {remote or 'nobody'}",
+                bool(remote),
+                "caller certificate verified end-to-end through the east-west gateways",
+            )
+
+
+def test_gateways() -> None:
+    print("\n--- 6. East-west gateways (attacked from the host) ---")
+    for cluster in CLUSTERS:
+        port = GATEWAY_HOST_PORTS[cluster]
+        routable = exported(cluster)
+        hidden = next(w for w in WORKLOADS.values() if w.cluster == cluster and w not in routable)
+        some_caller = next(iter(routable[0].callers))
+        # Valid, authorized certificate, but the service is not exported.
+        status, body = https_get(port, hidden.fqdn, "/health", pair(some_caller))
+        report(
+            f"{cluster} gateway: non-exported {hidden.name} is not routable",
+            status is None,
+            body.splitlines()[0] if body else "",
+        )
+        for w in routable:
+            remote_caller = next(c for c in w.callers if WORKLOADS[c].cluster != cluster)
+            status, body = https_get(port, w.fqdn, "/health", pair(remote_caller))
+            report(
+                f"{cluster} gateway -> {w.name}: {remote_caller} certificate succeeds",
+                status == 200 and '"status":"ok"' in body,
+                f"status {status}",
+            )
+            status, body = https_get(port, w.fqdn, "/health", ATTACKER)
+            report(
+                f"{cluster} gateway -> {w.name}: untrusted certificate rejected by the sidecar",
+                rejected_at_tls(status, body),
+                body.splitlines()[0] if body else "",
+            )
+            outsider = next(s for s in WORKLOADS if s not in w.callers and s != w.name)
+            status, body = https_get(port, w.fqdn, "/health", pair(outsider))
+            report(
+                f"{cluster} gateway -> {w.name}: unauthorized {outsider} gets 403",
+                status == 403 and "IDENTITY_NOT_AUTHORIZED" in body,
+                f"status {status}",
+            )
 
 
 def main() -> int:
     print("=" * 70)
-    print("  MESHBANK SERVICE MESH & mTLS COMPLIANCE TEST SUITE")
+    print(f"  MESHBANK SERVICE MESH & mTLS TEST SUITE ({topology()} cluster topology)")
     print("=" * 70)
+    if not test_artifacts():
+        print("\nRun 'make k8s-up' first (it generates the certificates).")
+        return 1
 
-    # 1. Verify certificate files exist
-    print("\n--- Phase 1.1: Certificate & Workload Identity Artifacts ---")
-    for f_path, label in [
-        (CA_CERT, "Mesh Root CA"),
-        (PAYMENT_CERT, "payment-service client certificate"),
-        (PAYMENT_KEY, "payment-service private key"),
-        (TRANSACTION_CERT, "transaction-service certificate"),
-        (TRANSACTION_KEY, "transaction-service private key"),
-        (ATTACKER_CERT, "Attacker rogue certificate"),
-        (ATTACKER_KEY, "Attacker rogue key"),
-    ]:
-        exists = os.path.exists(f_path)
-        report(f"Artifact {label} exists", exists, f"Path: {f_path}")
+    test_plaintext_bypass()
 
-    # 2. Test Plaintext Bypass Rejection
-    print("\n--- Phase 1.2: Plaintext Bypass Rejection (Network Restriction) ---")
-    url_tx_internal = "http://localhost:30003/internal/payment-debits"
-    try:
-        r = httpx.post(url_tx_internal, timeout=3.0)
-        is_rejected = r.status_code == 403 and "MTLS_REQUIRED" in r.text
-        report(
-            "Plaintext request to transaction-service /internal/ is blocked",
-            is_rejected,
-            f"Status: {r.status_code}, Body: {r.text.strip()}",
-        )
-    except Exception as exc:
-        report("Plaintext request to transaction-service /internal/ is blocked", False, str(exc))
-
-    url_pay_internal = "http://localhost:30004/internal/payment-debits"
-    try:
-        r = httpx.post(url_pay_internal, timeout=3.0)
-        is_rejected = r.status_code == 403 and "MTLS_REQUIRED" in r.text
-        report(
-            "Plaintext request to payment-service /internal/ is blocked",
-            is_rejected,
-            f"Status: {r.status_code}, Body: {r.text.strip()}",
-        )
-    except Exception as exc:
-        report("Plaintext request to payment-service /internal/ is blocked", False, str(exc))
-
-    # 3. Test Direct mTLS Handshakes via port-forward
-    print("\n--- Phase 1.3: Direct mTLS Handshake & Identity Verification ---")
-    pf_proc = subprocess.Popen(
-        ["kubectl", "port-forward", "svc/transaction-service", "-n", "meshbank", "18443:8443"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    time.sleep(2)  # Allow port-forward to establish
-
-    hostname = "transaction-service.meshbank.svc.cluster.local"
-    try:
-        # 3a. Missing Client Certificate -> MUST BE REJECTED
-        status, body = send_raw_https(
-            port=18443,
-            hostname=hostname,
-            path="/health",
-            cafile=CA_CERT,
-            certfile=None,
-            keyfile=None,
-        )
-        rejected_no_cert = (status == 400 and "No required SSL certificate was sent" in body) or (status is None and "SSLError" in body)
-        report(
-            "Request without client certificate is rejected by mTLS sidecar",
-            rejected_no_cert,
-            f"Status: {status}, Response: {body.splitlines()[0] if body else ''}",
-        )
-
-        # 3b. Untrusted Attacker Certificate -> MUST BE REJECTED
-        status, body = send_raw_https(
-            port=18443,
-            hostname=hostname,
-            path="/health",
-            cafile=CA_CERT,
-            certfile=ATTACKER_CERT,
-            keyfile=ATTACKER_KEY,
-        )
-        rejected_attacker = (status == 400 and "The SSL certificate error" in body) or (status is None and "SSLError" in body)
-        report(
-            "Request with untrusted attacker certificate is rejected by mTLS sidecar",
-            rejected_attacker,
-            f"Status: {status}, Response: {body.splitlines()[0] if body else ''}",
-        )
-
-        # 3c. Valid Workload Certificate (payment-service) -> MUST SUCCEED (200 OK)
-        status, body = send_raw_https(
-            port=18443,
-            hostname=hostname,
-            path="/health",
-            cafile=CA_CERT,
-            certfile=PAYMENT_CERT,
-            keyfile=PAYMENT_KEY,
-        )
-        valid_success = status == 200 and '"status":"ok"' in body
-        report(
-            "Request with valid payment-service workload certificate succeeds",
-            valid_success,
-            f"Status: {status}, Body: {body.splitlines()[-1] if body else ''}",
-        )
-
-    finally:
-        pf_proc.terminate()
+    print("\n--- 3/4. mTLS port: authentication and caller authorization ---")
+    for i, service in enumerate(WORKLOADS):
         try:
-            pf_proc.wait(timeout=2)
-        except Exception:
-            pf_proc.kill()
+            test_mtls_port(service, 18440 + i)
+        except RuntimeError as exc:
+            report(f"{service}: mTLS port reachable", False, str(exc))
 
-    # 4. In-Cluster Sidecar Mediation (Payment -> Transaction Workflow)
-    print("\n--- Phase 1.4: In-Cluster Mesh Traffic Mediation ---")
+    print("\n--- 4b. End-to-end banking workflows through the mesh ---")
     ret, out, err = run_cmd([sys.executable, str(ROOT_DIR / "k8s" / "k8s-smoke-test.py")])
     report(
-        "End-to-End banking transaction & bill payment through mesh proxies",
+        "transfers, payment, notifications over mTLS",
         ret == 0,
-        "All 9 steps (Transfers, bill payments, balance updates) executed through sidecar proxies"
-        if ret == 0
-        else f"Error: {out[-300:]}",
+        "" if ret == 0 else (out + "\n" + err)[-600:],
     )
 
-    # 5. Sidecar Proxy Logs Verification (mTLS cipher, protocol, client DN)
-    print("\n--- Phase 1.5: Sidecar Proxy Structured Logs & Metrics ---")
-    ret, logs, _ = run_cmd([
-        "kubectl", "logs", "-l", "app=transaction-service", "-c", "mesh-sidecar", "-n", "meshbank", "--tail=30"
-    ])
-    found_mtls_log = False
-    verified_entry = {}
-    for line in logs.splitlines():
-        try:
-            data = json.loads(line)
-            if (
-                data.get("ssl_client_verify") == "SUCCESS"
-                and "payment-service" in data.get("ssl_client_s_dn", "")
-            ):
-                found_mtls_log = True
-                verified_entry = data
-                break
-        except Exception:
-            continue
+    test_sidecar_logs()
+    if topology() == MULTI:
+        test_gateways()
 
-    report(
-        "Transaction sidecar captured valid mTLS handshake with payment-service",
-        found_mtls_log,
-        f"Verified log: Protocol={verified_entry.get('ssl_protocol')}, "
-        f"Cipher={verified_entry.get('ssl_cipher')}, "
-        f"Client-DN={verified_entry.get('ssl_client_s_dn')}, "
-        f"Latency={verified_entry.get('request_time')}s",
+    ret, metrics, _ = run_cmd(
+        [
+            "kubectl",
+            "--context",
+            kube_context("transaction-service"),
+            "exec",
+            "deployment/transaction-service",
+            "-c",
+            "mesh-sidecar",
+            "-n",
+            "meshbank",
+            "--",
+            "wget",
+            "-qO-",
+            "http://127.0.0.1:9102/metrics",
+        ]
     )
-
-    # 6. Proxy Metrics Verification
-    ret, metrics_out, _ = run_cmd([
-        "kubectl", "exec", "deployment/transaction-service", "-c", "mesh-sidecar", "-n", "meshbank", "--",
-        "wget", "-qO-", "http://127.0.0.1:9102/metrics"
-    ])
-    has_metrics = "Active connections" in metrics_out or "server accepts handled requests" in metrics_out
-    report(
-        "Sidecar metrics endpoint (port 9102) active and recording stats",
-        has_metrics,
-        metrics_out.strip(),
-    )
+    report("sidecar stub_status metrics on :9102", ret == 0 and "Active connections" in metrics)
 
     print("\n" + "=" * 70)
-    print(f"  TEST SUMMARY: {PASS_COUNT} PASSED, {FAIL_COUNT} FAILED")
+    print(f"  SUMMARY: {PASSED} passed, {FAILED} failed")
     print("=" * 70)
-    return 0 if FAIL_COUNT == 0 else 1
+    return 0 if FAILED == 0 else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

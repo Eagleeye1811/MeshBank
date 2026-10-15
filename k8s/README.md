@@ -1,112 +1,101 @@
 # MeshBank Kubernetes Deployment
 
-This directory contains the production-grade Kubernetes manifests, configuration, and automation scripts for deploying **MeshBank** to a local Kubernetes cluster (Kind or Minikube).
+Manifests and scripts for running MeshBank on a local **kind** cluster with an
+NGINX sidecar service mesh (mTLS between all services) and a canary release of
+`payment-service`. Design and security model: main README sections 16-17.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-                      +---------------------------------------+
-                      |       Kubernetes Node (Kind)          |
-                      |                                       |
-  [:30001] ---------> |  [auth-nodeport] -> auth-service      |
-  [:30002] ---------> |  [account-nodeport] -> account-service|
-  [:30003] ---------> |  [txn-nodeport] -> transaction-service|
-  [:30004] ---------> |  [pay-nodeport] -> payment-service    |
-  [:30005] ---------> |  [fraud-nodeport] -> fraud-service    |
-  [:30006] ---------> |  [notif-nodeport] -> notif-service    |
-                      |                                       |
-                      |  [postgres:5432]                      |
-                      |    - PersistentVolumeClaim (2Gi)      |
-                      |    - 6 isolated DBs + roles           |
-                      |    - Automated Alembic migrations     |
-                      +---------------------------------------+
+ host :30001-30006 (NodePorts)
+   │
+   ▼                         every pod: app on 127.0.0.1:8080 + mesh-sidecar
+ auth ─ account ─ transaction ─ fraud ─ notification       (public port 80xx,
+   │                                                         mTLS :8443,
+   └── payment-router ──▶ payment-service-stable (v1)        egress 127.0.0.1:90xx,
+                     └──▶ payment-service-canary (v2)        metrics :9102)
+
+ service ⇄ service: app → own sidecar (loopback) ══mTLS══▶ target sidecar :8443 → app
+ PostgreSQL 15 (one database + role per service), reachable only from meshed pods
 ```
 
-### Components & Manifests
+| File | Contents |
+|---|---|
+| [`namespace.yaml`](namespace.yaml) | `meshbank` namespace |
+| [`configmap.yaml`](configmap.yaml) | Shared settings; service URLs point at the local sidecar egress ports |
+| [`secrets.yaml`](secrets.yaml) | PostgreSQL password, internal API token (development values) |
+| [`postgres.yaml`](postgres.yaml) | PostgreSQL with per-service databases and roles |
+| [`auth-service.yaml`](auth-service.yaml), [`account-service.yaml`](account-service.yaml), [`transaction-service.yaml`](transaction-service.yaml), [`fraud-notification.yaml`](fraud-notification.yaml) | Deployments (app + sidecar) and Services |
+| [`payment-service.yaml`](payment-service.yaml), [`payment-canary.yaml`](payment-canary.yaml) | Stable and canary payment deployments, their Services, the payment router |
+| [`mesh-sidecar-configs.yaml`](mesh-sidecar-configs.yaml) | **Generated** sidecar NGINX configs (`make mesh-configs`) |
+| [`mesh-router-config.yaml`](mesh-router-config.yaml) | Canary router NGINX config (default 80/20) |
+| [`network-policy-mesh.yaml`](network-policy-mesh.yaml) | mTLS port only from meshed pods; PostgreSQL only from meshed pods |
+| [`nodeports.yaml`](nodeports.yaml), [`kind-cluster.yaml`](kind-cluster.yaml) | Host access on ports 30001-30006 |
+| `mesh-certs.yaml`, `certs/` | **Generated, git-ignored** mesh CA and workload certificates |
 
-| Manifest | Kind | Purpose |
-|---|---|---|
-| [`namespace.yaml`](file:///c:/Projects/MeshBank/k8s/namespace.yaml) | `Namespace` | Creates isolated `meshbank` namespace |
-| [`configmap.yaml`](file:///c:/Projects/MeshBank/k8s/configmap.yaml) | `ConfigMap` | Shared service URLs, environment, log level, timeouts |
-| [`secrets.yaml`](file:///c:/Projects/MeshBank/k8s/secrets.yaml) | `Secret` | PostgreSQL password, internal API token |
-| [`postgres.yaml`](file:///c:/Projects/MeshBank/k8s/postgres.yaml) | `Deployment`, `PVC`, `ConfigMap`, `Service` | PostgreSQL 15 instance with per-service databases and credentials |
-| [`auth-service.yaml`](file:///c:/Projects/MeshBank/k8s/auth-service.yaml) | `Deployment`, `Service` | Authentication service with RS256 private key and public key mounts |
-| [`account-service.yaml`](file:///c:/Projects/MeshBank/k8s/account-service.yaml) | `Deployment`, `Service` | Account ledger with dev balance seeding enabled |
-| [`transaction-service.yaml`](file:///c:/Projects/MeshBank/k8s/transaction-service.yaml) | `Deployment`, `Service` | Money transfer saga orchestrator |
-| [`payment-service.yaml`](file:///c:/Projects/MeshBank/k8s/payment-service.yaml) | `Deployment`, `Service` | Bill & merchant payment workflow with simulated provider |
-| [`fraud-notification.yaml`](file:///c:/Projects/MeshBank/k8s/fraud-notification.yaml) | `Deployment`, `Service` | Fraud evaluation and simulated notification delivery services |
-| [`nodeports.yaml`](file:///c:/Projects/MeshBank/k8s/nodeports.yaml) | `Service` (NodePort) | Exposes ports 30001–30006 for direct host access |
-| [`kind-cluster.yaml`](file:///c:/Projects/MeshBank/k8s/kind-cluster.yaml) | `Cluster` (Kind) | Single-node Kind cluster definition mapping host ports 30001–30006 |
+The mesh call graph and caller allow-lists are defined once in
+[`../scripts/mesh_topology.py`](../scripts/mesh_topology.py).
 
----
+## Quick start (macOS / Linux)
 
-## Security & Operational Features
+Prerequisites: Docker Desktop running, `brew install kind kubectl`
+(kind ≥ 0.24 for NetworkPolicy enforcement), and `make install`.
 
-1. **Least Privilege Security Context:**
-   - Pods run as non-root user `10001:10001`.
-   - `readOnlyRootFilesystem: true` with ephemeral `emptyDir` mounts for `/tmp` and `/data`.
-   - `allowPrivilegeEscalation: false` and `capabilities.drop: [ALL]`.
-2. **Health & Readiness Probes:**
-   - **Liveness:** `GET /health` ensures process liveness.
-   - **Readiness:** `GET /ready` checks PostgreSQL connectivity and schema readiness.
-3. **Automated Schema Migrations:**
-   - On startup, each service inspects and applies Alembic migrations via `DB_MIGRATION_MODE="upgrade"`.
-4. **Zero Shared Database Credentials:**
-   - Each microservice has an isolated database (`meshbank_auth`, `meshbank_account`, etc.) and distinct PostgreSQL role.
-5. **Decentralized JWT Validation:**
-   - Public keys (`dev-local-1.pem`) mounted into `/run/meshbank/jwt-public` across all services.
-   - Private key mounted **only** in `auth-service` with restrictive mode `0400`.
-
----
-
-## Quick Start
-
-### 1. Prerequisites
-- Docker Desktop (running Linux containers)
-- `kubectl`
-- `kind` (v0.20+)
-- PowerShell (pwsh) or GNU Make
-
-### 2. Deploy Everything
-Run the automated deployment script from the repository root:
-```powershell
-.\k8s\deploy.ps1
-```
-Or with Make:
 ```bash
-make k8s-up
-```
-
-This will:
-1. Create the Kind cluster with host port mappings.
-2. Load all 6 microservice Docker images + PostgreSQL into the cluster nodes.
-3. Apply namespace, ConfigMaps, and inject RS256 JWT keys as Secrets.
-4. Deploy PostgreSQL and wait for readiness.
-5. Deploy all 6 microservices and NodePort services.
-6. Wait for all rollouts to complete.
-
-### 3. Verify Deployment
-Check pod and service status:
-```bash
-kubectl get pods,svc -n meshbank
-```
-
-Run the end-to-end Kubernetes smoke test:
-```powershell
-.\.venv\Scripts\python.exe k8s\k8s-smoke-test.py
-```
-Or with Make:
-```bash
-make k8s-test
-```
-
-### 4. Tear Down
-```powershell
-.\k8s\delete.ps1
-```
-Or:
-```bash
+make k8s-up            # build images (incl. payment v2), create cluster, deploy
+make k8s-status
+make k8s-test          # banking smoke test: every service hop over mTLS
+make k8s-mtls-test     # mesh security tests
+make k8s-canary-demo   # 90/10 → 50/50 → 0/100 → 100/0
 make k8s-down
 ```
+
+Options: `SKIP_BUILD=1 make k8s-up` reuses images; `ROTATE_CERTS=1 make k8s-up`
+issues a new mesh CA and restarts the pods. Re-running `make k8s-up` is safe:
+it keeps the existing certificates, applies changes, and restarts the
+deployments so they pick up rebuilt images and configs.
+
+## Two clusters (AWS / GCP simulation)
+
+```bash
+make k8s-multi-up        # kind-meshbank-aws + kind-meshbank-gcp, joined by east-west gateways
+make k8s-multi-test
+make k8s-multi-mtls-test
+make k8s-multi-down
+```
+
+Files: [`multicluster/kind-aws.yaml`](multicluster/kind-aws.yaml),
+[`multicluster/kind-gcp.yaml`](multicluster/kind-gcp.yaml),
+`multicluster/mesh-sidecar-configs.yaml` and `multicluster/east-west-gateway.yaml`
+(both **generated**). [`deploy-multicluster.sh`](deploy-multicluster.sh) sends
+each cluster only its own objects (`scripts/cluster_manifests.py`) and points
+each `<cluster>-gateway` alias at the other cluster. Shared steps live in
+[`lib.sh`](lib.sh). Design: main README section 18.
+
+The ops scripts take the cluster from `MESHBANK_TOPOLOGY` (`single` by default,
+or `multi`) and always pass an explicit `--context`, so they never act on
+whatever cluster kubectl currently points at.
+
+## Windows
+
+```powershell
+.\k8s\deploy.ps1            # or -SkipBuild
+.\k8s\test-mesh-mtls.ps1
+.\k8s\canary-traffic.ps1 -Command demo-rollout
+.\k8s\delete.ps1
+```
+
+## Development-only funding
+
+`/internal/*` is reachable only over mTLS inside the cluster, so seed balances
+with the account service's CLI in its pod:
+
+```bash
+kubectl exec -n meshbank deployment/account-service -c account-service -- \
+  python -m app.dev_seed --account-id <uuid> --amount 5000.00
+```
+
+The dashboard's "Add test money" button runs the same command through the Vite
+dev server.
