@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import DeclarativeBase
 
@@ -73,6 +74,13 @@ def create_service_app(
         database_url=settings.database_url,
         base=base,
         db=db,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     app.add_middleware(RequestContextMiddleware)
     install_error_handlers(app)

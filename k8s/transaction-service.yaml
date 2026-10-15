@@ -1,0 +1,106 @@
+---
+# Transaction Service — depends on account, fraud, notification
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-service
+  namespace: meshbank
+  labels:
+    app: transaction-service
+    version: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: transaction-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: transaction-service
+        version: "1"
+        meshbank-sidecar: "enabled"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: transaction-service
+          image: meshbank/transaction-service:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8003
+          envFrom:
+            - configMapRef:
+                name: meshbank-common
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://transaction_svc:meshbank_transaction_dev@postgres:5432/meshbank_transaction"
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-api-token
+                  key: token
+          volumeMounts:
+            - name: jwt-public-keys
+              mountPath: /run/meshbank/jwt-public
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8003
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: jwt-public-keys
+          secret:
+            secretName: jwt-public-keys
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-service
+  namespace: meshbank
+spec:
+  selector:
+    app: transaction-service
+  ports:
+    - name: http
+      port: 8003
+      targetPort: 8003

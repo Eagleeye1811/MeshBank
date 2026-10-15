@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: meshbank
+  labels:
+    app: auth-service
+    version: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: auth-service
+        version: "1"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: auth-service
+          image: meshbank/auth-service:dev
+          imagePullPolicy: Never   # loaded via `kind load docker-image`
+          ports:
+            - name: http
+              containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: meshbank-common
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://auth_svc:meshbank_auth_dev@postgres:5432/meshbank_auth"
+            - name: JWT_SIGNING_KEY_ID
+              value: "dev-local-1"
+            - name: JWT_PRIVATE_KEY_FILE
+              value: "/run/secrets/jwt-signing-key/dev-local-1.pem"
+            - name: ACCESS_TOKEN_TTL_SECONDS
+              value: "900"
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-api-token
+                  key: token
+          volumeMounts:
+            - name: jwt-public-keys
+              mountPath: /run/meshbank/jwt-public
+              readOnly: true
+            - name: jwt-signing-key
+              mountPath: /run/secrets/jwt-signing-key
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: jwt-public-keys
+          secret:
+            secretName: jwt-public-keys
+        - name: jwt-signing-key
+          secret:
+            secretName: jwt-signing-key
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: meshbank
+spec:
+  selector:
+    app: auth-service
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001

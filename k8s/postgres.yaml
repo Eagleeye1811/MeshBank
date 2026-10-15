@@ -1,0 +1,120 @@
+---
+# Single shared PostgreSQL instance with one database per service.
+# This keeps resource usage low for a local demonstration cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: meshbank
+data:
+  init.sql: |
+    CREATE USER auth_svc        WITH PASSWORD 'meshbank_auth_dev';
+    CREATE USER account_svc     WITH PASSWORD 'meshbank_account_dev';
+    CREATE USER transaction_svc WITH PASSWORD 'meshbank_transaction_dev';
+    CREATE USER payment_svc     WITH PASSWORD 'meshbank_payment_dev';
+    CREATE USER fraud_svc       WITH PASSWORD 'meshbank_fraud_dev';
+    CREATE USER notification_svc WITH PASSWORD 'meshbank_notification_dev';
+
+    CREATE DATABASE meshbank_auth        OWNER auth_svc;
+    CREATE DATABASE meshbank_account     OWNER account_svc;
+    CREATE DATABASE meshbank_transaction OWNER transaction_svc;
+    CREATE DATABASE meshbank_payment     OWNER payment_svc;
+    CREATE DATABASE meshbank_fraud       OWNER fraud_svc;
+    CREATE DATABASE meshbank_notification OWNER notification_svc;
+
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_auth        TO auth_svc;
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_account     TO account_svc;
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_transaction TO transaction_svc;
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_payment     TO payment_svc;
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_fraud       TO fraud_svc;
+    GRANT ALL PRIVILEGES ON DATABASE meshbank_notification TO notification_svc;
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: meshbank
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: meshbank
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: postgres
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-superuser
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, postgres]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, postgres]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: init
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: meshbank
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,20 @@
+---
+# Shared environment values used by every service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meshbank-common
+  namespace: meshbank
+data:
+  APP_ENV: "development"
+  LOG_LEVEL: "INFO"
+  JWT_PUBLIC_KEYS_DIR: "/run/meshbank/jwt-public"
+  JWT_ISSUER: "meshbank-auth"
+  JWT_AUDIENCE: "meshbank-api"
+  HTTP_TIMEOUT_SECONDS: "5"
+  DB_MIGRATION_MODE: "upgrade"
+  ACCOUNT_SERVICE_URL: "http://account-service:8002"
+  TRANSACTION_SERVICE_URL: "http://transaction-service:8003"
+  FRAUD_SERVICE_URL: "http://fraud-service:8005"
+  NOTIFICATION_SERVICE_URL: "http://notification-service:8006"
+  RECOVERY_INTERVAL_SECONDS: "30"

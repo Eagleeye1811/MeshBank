@@ -80,3 +80,19 @@ recover: ## Trigger one recovery pass in transaction- and payment-service
 
 reset-dev: ## DELETE all local dev data (requires CONFIRM=yes)
 	CONFIRM=$(CONFIRM) scripts/reset_dev.sh
+
+k8s-up: ## Deploy MeshBank onto local kind Kubernetes cluster
+	powershell -File k8s/deploy.ps1
+
+k8s-down: ## Tear down the MeshBank kind Kubernetes cluster
+	kind delete cluster --name meshbank
+
+k8s-status: ## Check Kubernetes pod and service status
+	kubectl get pods,svc,endpoints -n meshbank
+
+k8s-test: ## Run the Kubernetes banking smoke test
+	$(PY) k8s/k8s-smoke-test.py
+
+frontend: ## Start the MeshBank React + Vite + Tailwind dashboard (http://localhost:5173)
+	cd frontend && npm run dev
+

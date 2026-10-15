@@ -1,0 +1,27 @@
+# kind cluster configuration for MeshBank local development.
+# Creates a single-node cluster with host port mappings for each service.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: meshbank
+nodes:
+  - role: control-plane
+    # Port mappings allow `kubectl port-forward` and direct curl from Windows host.
+    extraPortMappings:
+      - containerPort: 30001
+        hostPort: 30001
+        protocol: TCP
+      - containerPort: 30002
+        hostPort: 30002
+        protocol: TCP
+      - containerPort: 30003
+        hostPort: 30003
+        protocol: TCP
+      - containerPort: 30004
+        hostPort: 30004
+        protocol: TCP
+      - containerPort: 30005
+        hostPort: 30005
+        protocol: TCP
+      - containerPort: 30006
+        hostPort: 30006
+        protocol: TCP
