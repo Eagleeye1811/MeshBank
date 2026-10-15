@@ -72,6 +72,7 @@ kubectl config use-context kind-meshbank
 Write-Host "`n[3/7] Loading Docker images into kind cluster..." -ForegroundColor Cyan
 $images = @(
     "postgres:15-alpine",
+    "nginx:alpine",
     "meshbank/auth-service:dev",
     "meshbank/account-service:dev",
     "meshbank/transaction-service:dev",
@@ -84,13 +85,16 @@ foreach ($img in $images) {
     kind load docker-image $img --name meshbank
 }
 
-# ── 5. Apply namespace, ConfigMap, base Secrets ───────────────────────────────
-Write-Host "`n[4/7] Applying namespace, ConfigMap and base manifests..." -ForegroundColor Cyan
+# ── 5. Generate Service Mesh mTLS Certificates & Configs ──────────────────────
+Write-Host "`n[4/7] Generating Mesh CA, Workload certs, and applying configs..." -ForegroundColor Cyan
+.\.venv\Scripts\python.exe scripts\generate_mesh_certs.py
 kubectl apply -f k8s\namespace.yaml
 kubectl apply -f k8s\configmap.yaml
-
-# Apply base secrets (superuser password, internal token)
 kubectl apply -f k8s\secrets.yaml
+kubectl apply -f k8s\mesh-certs.yaml
+kubectl apply -f k8s\mesh-sidecar-configs.yaml
+kubectl apply -f k8s\mesh-router-config.yaml
+kubectl apply -f k8s\network-policy-mesh.yaml
 
 # Inject actual JWT public and private keys from files
 Write-Host "  Creating/updating secret 'jwt-public-keys' from $pubKey..."
@@ -106,19 +110,21 @@ Write-Host "  Waiting for postgres rollout..."
 kubectl rollout status deployment/postgres -n meshbank --timeout=120s
 
 # ── 7. Deploy banking services ────────────────────────────────────────────────
-Write-Host "`n[6/7] Deploying banking services..." -ForegroundColor Cyan
+Write-Host "`n[6/7] Deploying banking services (with Service Mesh sidecars & Canary)..." -ForegroundColor Cyan
 kubectl apply -f k8s\auth-service.yaml
 kubectl apply -f k8s\account-service.yaml
 kubectl apply -f k8s\fraud-notification.yaml
 kubectl apply -f k8s\transaction-service.yaml
 kubectl apply -f k8s\payment-service.yaml
+kubectl apply -f k8s\payment-canary.yaml
 kubectl apply -f k8s\nodeports.yaml
 
 # Wait for all deployments
 Write-Host "`n[7/7] Waiting for all deployments to be ready (up to 3 min)..." -ForegroundColor Cyan
 $deployments = @(
     "auth-service", "account-service", "fraud-service",
-    "notification-service", "transaction-service", "payment-service"
+    "notification-service", "transaction-service", "payment-service",
+    "payment-service-canary", "payment-router"
 )
 foreach ($d in $deployments) {
     Write-Host "  Waiting: $d"

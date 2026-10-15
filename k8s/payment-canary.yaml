@@ -1,0 +1,283 @@
+---
+# Payment Service Canary Deployment (Track: canary, Version: v2)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service-canary
+  namespace: meshbank
+  labels:
+    app: payment-service-backend
+    track: canary
+    version: "2"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-service-backend
+      track: canary
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: payment-service-backend
+        track: canary
+        version: "2"
+        meshbank-sidecar: "enabled"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        # Canary Microservice Application Container
+        - name: payment-service
+          image: meshbank/payment-service:dev
+          imagePullPolicy: Never
+          args: ["uvicorn", "--factory", "app.main:create_app", "--host", "127.0.0.1", "--port", "8080", "--no-access-log"]
+          ports:
+            - name: loopback
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: meshbank-common
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://payment_svc:meshbank_payment_dev@postgres:5432/meshbank_payment"
+            - name: TRANSACTION_SERVICE_URL
+              value: "http://127.0.0.1:9003"
+            - name: PAYMENT_PROVIDER_DECLINE_PREFIX
+              value: "DECLINE"
+            - name: PAYMENT_PROVIDER_MAX_AMOUNT
+              value: "100000.00"
+            - name: SERVICE_TRACK
+              value: "canary"
+            - name: SERVICE_VERSION
+              value: "v2"
+            - name: INTERNAL_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: internal-api-token
+                  key: token
+          volumeMounts:
+            - name: jwt-public-keys
+              mountPath: /run/meshbank/jwt-public
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8004
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+        # Service Mesh Canary Sidecar Container
+        - name: mesh-sidecar
+          image: nginx:alpine
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8004
+            - name: mesh-mtls
+              containerPort: 8443
+            - name: metrics
+              containerPort: 9102
+          volumeMounts:
+            - name: sidecar-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: mesh-certs
+              mountPath: /etc/mesh/certs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+
+      volumes:
+        - name: jwt-public-keys
+          secret:
+            secretName: jwt-public-keys
+        - name: sidecar-config
+          configMap:
+            name: payment-canary-sidecar-config
+        - name: mesh-certs
+          secret:
+            secretName: payment-mesh-certs
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+---
+# Service pointing directly to Canary Backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service-canary
+  namespace: meshbank
+spec:
+  selector:
+    app: payment-service-backend
+    track: canary
+  ports:
+    - name: http
+      port: 8004
+      targetPort: 8004
+    - name: mesh-mtls
+      port: 8443
+      targetPort: 8443
+    - name: metrics
+      port: 9102
+      targetPort: 9102
+---
+# Service pointing directly to Stable Backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service-stable
+  namespace: meshbank
+spec:
+  selector:
+    app: payment-service-backend
+    track: stable
+  ports:
+    - name: http
+      port: 8004
+      targetPort: 8004
+    - name: mesh-mtls
+      port: 8443
+      targetPort: 8443
+    - name: metrics
+      port: 9102
+      targetPort: 9102
+---
+# Payment Traffic Router Deployment (splits traffic between stable and canary)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-router
+  namespace: meshbank
+  labels:
+    app: payment-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-router
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: payment-router
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: router
+          image: nginx:alpine
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8004
+            - name: metrics
+              containerPort: 9102
+          volumeMounts:
+            - name: router-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: router-config
+          configMap:
+            name: payment-router-config
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,392 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transaction-sidecar-config
+  namespace: meshbank
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    worker_processes 1;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp_path;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+
+        resolver 10.96.0.10 valid=10s ipv6=off;
+
+        log_format mesh_json escape=json '{'
+          '"time":"$time_iso8601",'
+          '"proxy":"transaction-sidecar",'
+          '"client_ip":"$remote_addr",'
+          '"ssl_client_s_dn":"$ssl_client_s_dn",'
+          '"ssl_client_verify":"$ssl_client_verify",'
+          '"ssl_protocol":"$ssl_protocol",'
+          '"ssl_cipher":"$ssl_cipher",'
+          '"method":"$request_method",'
+          '"uri":"$request_uri",'
+          '"status":$status,'
+          '"bytes_sent":$bytes_sent,'
+          '"request_time":$request_time,'
+          '"upstream_response_time":"$upstream_response_time"'
+        '}';
+
+        access_log /dev/stdout mesh_json;
+        error_log /dev/stderr warn;
+
+        # 1. Mesh mTLS Ingress Server (Port 8443)
+        server {
+            listen 8443 ssl;
+            server_name transaction-service transaction-service.meshbank transaction-service.meshbank.svc transaction-service.meshbank.svc.cluster.local localhost;
+
+            ssl_certificate /etc/mesh/certs/tls.crt;
+            ssl_certificate_key /etc/mesh/certs/tls.key;
+            ssl_client_certificate /etc/mesh/certs/ca.crt;
+            ssl_verify_client on;
+            ssl_verify_depth 2;
+
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers HIGH:!aNULL:!MD5;
+            ssl_prefer_server_ciphers on;
+
+            location / {
+                if ($ssl_client_verify != SUCCESS) {
+                    return 403 '{"error":{"code":"CERT_NOT_VERIFIED","message":"Client certificate verification failed"}}\n';
+                }
+
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto https;
+                proxy_set_header X-Mesh-Client-DN $ssl_client_s_dn;
+                proxy_set_header X-Mesh-Client-Verify $ssl_client_verify;
+            }
+        }
+
+        # 2. Public / Plaintext Ingress Server (Port 8003)
+        # Allows external public traffic to public endpoints, but strictly forbids /internal/ over plaintext
+        server {
+            listen 8003;
+            server_name _;
+
+            location /internal/ {
+                default_type application/json;
+                return 403 '{"error":{"code":"MTLS_REQUIRED","message":"Internal endpoints must be accessed via mTLS on port 8443"}}\n';
+            }
+
+            location / {
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+        }
+
+        # 3. Egress Proxy to Payment Service (Port 9004)
+        server {
+            listen 127.0.0.1:9004;
+            server_name _;
+
+            location / {
+                proxy_pass https://payment-service.meshbank.svc.cluster.local:8443;
+                proxy_ssl_certificate /etc/mesh/certs/tls.crt;
+                proxy_ssl_certificate_key /etc/mesh/certs/tls.key;
+                proxy_ssl_trusted_certificate /etc/mesh/certs/ca.crt;
+                proxy_ssl_verify on;
+                proxy_ssl_verify_depth 2;
+                proxy_ssl_name payment-service.meshbank.svc.cluster.local;
+                proxy_ssl_server_name on;
+                proxy_ssl_protocols TLSv1.2 TLSv1.3;
+
+                proxy_set_header Host payment-service.meshbank.svc.cluster.local;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+        }
+
+        # 4. Proxy Metrics and Health (Port 9102)
+        server {
+            listen 9102;
+            server_name _;
+
+            location /metrics {
+                stub_status;
+            }
+
+            location /health {
+                default_type application/json;
+                return 200 '{"status":"ok","proxy":"transaction-sidecar","mtls_port":8443}\n';
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-sidecar-config
+  namespace: meshbank
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    worker_processes 1;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp_path;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+
+        resolver 10.96.0.10 valid=10s ipv6=off;
+
+        log_format mesh_json escape=json '{'
+          '"time":"$time_iso8601",'
+          '"proxy":"payment-sidecar-stable",'
+          '"client_ip":"$remote_addr",'
+          '"ssl_client_s_dn":"$ssl_client_s_dn",'
+          '"ssl_client_verify":"$ssl_client_verify",'
+          '"ssl_protocol":"$ssl_protocol",'
+          '"ssl_cipher":"$ssl_cipher",'
+          '"method":"$request_method",'
+          '"uri":"$request_uri",'
+          '"status":$status,'
+          '"bytes_sent":$bytes_sent,'
+          '"request_time":$request_time,'
+          '"upstream_response_time":"$upstream_response_time"'
+        '}';
+
+        access_log /dev/stdout mesh_json;
+        error_log /dev/stderr warn;
+
+        # 1. Mesh mTLS Ingress Server (Port 8443)
+        server {
+            listen 8443 ssl;
+            server_name payment-service payment-service-stable payment-service.meshbank payment-service.meshbank.svc payment-service.meshbank.svc.cluster.local localhost;
+
+            ssl_certificate /etc/mesh/certs/tls.crt;
+            ssl_certificate_key /etc/mesh/certs/tls.key;
+            ssl_client_certificate /etc/mesh/certs/ca.crt;
+            ssl_verify_client on;
+            ssl_verify_depth 2;
+
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers HIGH:!aNULL:!MD5;
+            ssl_prefer_server_ciphers on;
+
+            location / {
+                if ($ssl_client_verify != SUCCESS) {
+                    return 403 '{"error":{"code":"CERT_NOT_VERIFIED","message":"Client certificate verification failed"}}\n';
+                }
+
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto https;
+                proxy_set_header X-Mesh-Client-DN $ssl_client_s_dn;
+                proxy_set_header X-Mesh-Client-Verify $ssl_client_verify;
+                add_header X-Mesh-Track "stable" always;
+                add_header X-Service-Version "v1" always;
+            }
+        }
+
+        # 2. Public / Plaintext Ingress Server (Port 8004)
+        server {
+            listen 8004;
+            server_name _;
+
+            location /internal/ {
+                default_type application/json;
+                return 403 '{"error":{"code":"MTLS_REQUIRED","message":"Internal endpoints must be accessed via mTLS on port 8443"}}\n';
+            }
+
+            location / {
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                add_header X-Mesh-Track "stable" always;
+                add_header X-Service-Version "v1" always;
+            }
+        }
+
+        # 3. Egress Proxy to Transaction Service (Port 9003)
+        server {
+            listen 127.0.0.1:9003;
+            server_name _;
+
+            location / {
+                proxy_pass https://transaction-service.meshbank.svc.cluster.local:8443;
+                proxy_ssl_certificate /etc/mesh/certs/tls.crt;
+                proxy_ssl_certificate_key /etc/mesh/certs/tls.key;
+                proxy_ssl_trusted_certificate /etc/mesh/certs/ca.crt;
+                proxy_ssl_verify on;
+                proxy_ssl_verify_depth 2;
+                proxy_ssl_name transaction-service.meshbank.svc.cluster.local;
+                proxy_ssl_server_name on;
+                proxy_ssl_protocols TLSv1.2 TLSv1.3;
+
+                proxy_set_header Host transaction-service.meshbank.svc.cluster.local;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+        }
+
+        # 4. Proxy Metrics and Health (Port 9102)
+        server {
+            listen 9102;
+            server_name _;
+
+            location /metrics {
+                stub_status;
+            }
+
+            location /health {
+                default_type application/json;
+                return 200 '{"status":"ok","proxy":"payment-sidecar-stable","mtls_port":8443}\n';
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-canary-sidecar-config
+  namespace: meshbank
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    worker_processes 1;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp_path;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+
+        resolver 10.96.0.10 valid=10s ipv6=off;
+
+        log_format mesh_json escape=json '{'
+          '"time":"$time_iso8601",'
+          '"proxy":"payment-sidecar-canary",'
+          '"client_ip":"$remote_addr",'
+          '"ssl_client_s_dn":"$ssl_client_s_dn",'
+          '"ssl_client_verify":"$ssl_client_verify",'
+          '"ssl_protocol":"$ssl_protocol",'
+          '"ssl_cipher":"$ssl_cipher",'
+          '"method":"$request_method",'
+          '"uri":"$request_uri",'
+          '"status":$status,'
+          '"bytes_sent":$bytes_sent,'
+          '"request_time":$request_time,'
+          '"upstream_response_time":"$upstream_response_time"'
+        '}';
+
+        access_log /dev/stdout mesh_json;
+        error_log /dev/stderr warn;
+
+        # 1. Mesh mTLS Ingress Server (Port 8443)
+        server {
+            listen 8443 ssl;
+            server_name payment-service payment-service-canary payment-service.meshbank payment-service.meshbank.svc payment-service.meshbank.svc.cluster.local localhost;
+
+            ssl_certificate /etc/mesh/certs/tls.crt;
+            ssl_certificate_key /etc/mesh/certs/tls.key;
+            ssl_client_certificate /etc/mesh/certs/ca.crt;
+            ssl_verify_client on;
+            ssl_verify_depth 2;
+
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers HIGH:!aNULL:!MD5;
+            ssl_prefer_server_ciphers on;
+
+            location / {
+                if ($ssl_client_verify != SUCCESS) {
+                    return 403 '{"error":{"code":"CERT_NOT_VERIFIED","message":"Client certificate verification failed"}}\n';
+                }
+
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto https;
+                proxy_set_header X-Mesh-Client-DN $ssl_client_s_dn;
+                proxy_set_header X-Mesh-Client-Verify $ssl_client_verify;
+                add_header X-Mesh-Track "canary" always;
+                add_header X-Service-Version "v2" always;
+            }
+        }
+
+        # 2. Public / Plaintext Ingress Server (Port 8004)
+        server {
+            listen 8004;
+            server_name _;
+
+            location /internal/ {
+                default_type application/json;
+                return 403 '{"error":{"code":"MTLS_REQUIRED","message":"Internal endpoints must be accessed via mTLS on port 8443"}}\n';
+            }
+
+            location / {
+                proxy_pass http://127.0.0.1:8080;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                add_header X-Mesh-Track "canary" always;
+                add_header X-Service-Version "v2" always;
+            }
+        }
+
+        # 3. Egress Proxy to Transaction Service (Port 9003)
+        server {
+            listen 127.0.0.1:9003;
+            server_name _;
+
+            location / {
+                proxy_pass https://transaction-service.meshbank.svc.cluster.local:8443;
+                proxy_ssl_certificate /etc/mesh/certs/tls.crt;
+                proxy_ssl_certificate_key /etc/mesh/certs/tls.key;
+                proxy_ssl_trusted_certificate /etc/mesh/certs/ca.crt;
+                proxy_ssl_verify on;
+                proxy_ssl_verify_depth 2;
+                proxy_ssl_name transaction-service.meshbank.svc.cluster.local;
+                proxy_ssl_server_name on;
+                proxy_ssl_protocols TLSv1.2 TLSv1.3;
+
+                proxy_set_header Host transaction-service.meshbank.svc.cluster.local;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+        }
+
+        # 4. Proxy Metrics and Health (Port 9102)
+        server {
+            listen 9102;
+            server_name _;
+
+            location /metrics {
+                stub_status;
+            }
+
+            location /health {
+                default_type application/json;
+                return 200 '{"status":"ok","proxy":"payment-sidecar-canary","mtls_port":8443}\n';
+            }
+        }
+    }

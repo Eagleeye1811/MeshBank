@@ -20,3 +20,5 @@ data/
 *.pem
 *.key
 secrets/
+k8s/certs/
+k8s/mesh-certs.yaml

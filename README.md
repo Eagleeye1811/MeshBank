@@ -508,3 +508,221 @@ Phase 1 is already shaped for this. All internal URLs are configuration.
 outside their databases. Request IDs are propagated. Outbound calls go through
 one client layer (`common/http_client.py`), and business logic does not
 depend on transport.
+
+---
+
+## 16. Service Mesh Architecture & mTLS Implementation
+
+### 16.1 Architecture Overview
+
+MeshBank implements a lightweight, cloud-native sidecar service mesh data plane for secure inter-service communication between critical banking services (`transaction-service` and `payment-service`):
+
+```
++---------------------------------------------------------------------------------------------------+
+| Kubernetes Namespace: meshbank                                                                    |
+|                                                                                                   |
+|  +---------------------------------------+       mTLS (Port 8443)      +------------------------+ |
+|  | Pod: payment-service                  |   TLSv1.3 / AES_256_GCM    | Pod: transaction-svc   | |
+|  |                                       |============================>|                        | |
+|  | [payment-service app]                 |  Client: payment-service    | [mesh-sidecar proxy]   | |
+|  |   Listens on: 127.0.0.1:8080          |  Server: transaction-service|   Port 8443: mTLS      | |
+|  |                                       |                             |   Port 8003: Public In | |
+|  | [mesh-sidecar proxy]                  |                             |   Port 9102: Metrics   | |
+|  |   Port 8004: Public Ingress           |                             |            │           | |
+|  |   Port 9003: Egress Proxy ────────────┘                             |            ▼ localhost | |
+|  |   Port 9102: Metrics                                                | [transaction-svc app]  | |
+|  +---------------------------------------+                             |   Listens: 127.0.0.1   | |
+|                                                                        +------------------------+ |
++---------------------------------------------------------------------------------------------------+
+```
+
+### 16.2 Core Security Controls
+
+1. **Mutual TLS (mTLS) Authentication:**
+   * Both sides of the communication verify cryptographic certificates issued by an internal **MeshBank Mesh Root CA**.
+   * Workload identities are encoded using SPIFFE Subject Alternative Names (SANs):
+     * `spiffe://meshbank.internal/ns/meshbank/sa/transaction-service`
+     * `spiffe://meshbank.internal/ns/meshbank/sa/payment-service`
+   * Communication strictly requires TLS 1.3/1.2 with forward secrecy (`TLS_AES_256_GCM_SHA384`).
+2. **Loopback Application Isolation & NetworkPolicy:**
+   * Core microservice application containers bind strictly to loopback (`127.0.0.1:8080`). They cannot be directly contacted from outside their Pod.
+   * All ingress and egress traffic is mediated through the sidecar proxy container.
+   * Kubernetes `NetworkPolicy` (`k8s/network-policy-mesh.yaml`) enforces that only authorized mesh traffic can reach the pods.
+3. **Strict Rejection of Bypass Attempts:**
+   * Sending plaintext HTTP requests directly to internal endpoints (`/internal/...`) on public ports 8003/8004 is rejected with `403 Forbidden` (`MTLS_REQUIRED`).
+   * Requests lacking client certificates are rejected with `400 Bad Request` (`No required SSL certificate was sent`).
+   * Requests presenting untrusted certificates (e.g., signed by an unauthorized/rogue CA) are rejected with `400 Bad Request` (`The SSL certificate error`).
+4. **Observability & Metrics:**
+   * Structured JSON logs capture client Subject DN (`ssl_client_s_dn`), verification status (`ssl_client_verify`), protocol, cipher, upstream latency, and response status.
+   * Dedicated `/metrics` endpoint on port `9102` provides active connection counts and traffic statistics.
+
+### 16.3 Setup & Verification Commands
+
+Generate certificates and deploy to the cluster:
+```powershell
+# 1. Generate Mesh Root CA and Workload Certificates
+.\.venv\Scripts\python.exe scripts\generate_mesh_certs.py
+
+# 2. Deploy to Kubernetes (or use deploy.ps1)
+.\k8s\deploy.ps1
+
+# 3. Run the automated Service Mesh & mTLS Compliance Test Suite
+.\k8s\test-mesh-mtls.ps1
+```
+
+Or run directly with Python:
+```bash
+python k8s/test-mesh-mtls.py
+```
+
+### 16.4 Actual Test Results
+
+```text
+======================================================================
+  MESHBANK SERVICE MESH & mTLS COMPLIANCE TEST SUITE
+======================================================================
+
+--- Phase 1.1: Certificate & Workload Identity Artifacts ---
+  [PASS] Artifact Mesh Root CA exists
+  [PASS] Artifact payment-service client certificate exists
+  [PASS] Artifact payment-service private key exists
+  [PASS] Artifact transaction-service certificate exists
+  [PASS] Artifact transaction-service private key exists
+  [PASS] Artifact Attacker rogue certificate exists
+  [PASS] Artifact Attacker rogue key exists
+
+--- Phase 1.2: Plaintext Bypass Rejection (Network Restriction) ---
+  [PASS] Plaintext request to transaction-service /internal/ is blocked (HTTP 403 MTLS_REQUIRED)
+  [PASS] Plaintext request to payment-service /internal/ is blocked (HTTP 403 MTLS_REQUIRED)
+
+--- Phase 1.3: Direct mTLS Handshake & Identity Verification ---
+  [PASS] Request without client certificate is rejected by mTLS sidecar (HTTP 400 No Cert)
+  [PASS] Request with untrusted attacker certificate is rejected by mTLS sidecar (HTTP 400 SSL Error)
+  [PASS] Request with valid payment-service workload certificate succeeds (HTTP 200 OK)
+
+--- Phase 1.4: In-Cluster Mesh Traffic Mediation ---
+  [PASS] End-to-End banking transaction & bill payment through mesh proxies (All 9 steps pass)
+
+--- Phase 1.5: Sidecar Proxy Structured Logs & Metrics ---
+  [PASS] Transaction sidecar captured valid mTLS handshake with payment-service
+         Protocol=TLSv1.3, Cipher=TLS_AES_256_GCM_SHA384, Client-DN=OU=Mesh Workload,O=MeshBank,CN=payment-service.meshbank.svc.cluster.local
+  [PASS] Sidecar metrics endpoint (port 9102) active and recording stats
+
+======================================================================
+  TEST SUMMARY: 15 PASSED, 0 FAILED
+======================================================================
+```
+
+---
+
+## 17. Phase 2: Traffic Management & Canary Deployment
+
+### 17.1 Canary Architecture
+
+MeshBank implements proxy-based dynamic traffic splitting between **Stable (`v1`)** and **Canary (`v2`)** versions of `payment-service`:
+
+```
+                           Incoming Requests (NodePort 30004 or Mesh)
+                                              │
+                                              ▼
+                             ┌─────────────────────────────────┐
+                             │         payment-router          │
+                             │   (NGINX Traffic Controller)    │
+                             └────────────────┬────────────────┘
+                                              │
+                    ┌─────────────────────────┴────────────────────────┐
+   Header Override  │                                                  │  Header Override
+   X-Canary: never  │ Default Split (e.g. 80% / 20%)                   │  X-Canary: always
+                    ▼                                                  ▼
+      ┌───────────────────────────┐                      ┌───────────────────────────┐
+      │  payment-service-stable   │                      │  payment-service-canary   │
+      │       (Track: stable)     │                      │       (Track: canary)     │
+      │         Version: v1       │                      │         Version: v2       │
+      │                           │                      │                           │
+      │  [mesh-sidecar] Port 8443 │                      │  [mesh-sidecar] Port 8443 │
+      │  [payment-app]  Port 8080 │                      │  [payment-app]  Port 8080 │
+      └─────────────┬─────────────┘                      └─────────────┬─────────────┘
+                    │                                                  │
+                    └───────────────── mTLS (Port 8443) ───────────────┘
+                                              │
+                                              ▼
+                                 ┌───────────────────────────┐
+                                 │    transaction-service    │
+                                 └───────────────────────────┘
+```
+
+### 17.2 Capabilities & Controls
+
+1. **Dynamic Weighted Traffic Splitting:**
+   * Split ratio can be updated on-the-fly without restarting pods or losing connections (e.g., 90/10, 50/50, 0/100, 100/0).
+   * Responses carry track and version headers for transparency:
+     * `X-Mesh-Track: stable` vs `canary`
+     * `X-Service-Version: v1` vs `v2`
+     * `X-Mesh-Router: payment-traffic-manager`
+2. **Header-based Routing (A/B Testing Overrides):**
+   * `X-Canary: always` routes 100% of requests to the Canary deployment regardless of weights.
+   * `X-Canary: never` routes 100% of requests to the Stable deployment.
+3. **Health-based Rollout & Automatic Rollback:**
+   * Circuit-breaking and fail-over with `max_fails=2 fail_timeout=5s`.
+   * Automated rollback restores 100% stable traffic instantly if the canary deployment becomes degraded or unavailable.
+
+### 17.3 Traffic Management Commands
+
+```powershell
+# Run the complete automated canary rollout lifecycle demo
+.\k8s\canary-traffic.ps1 -Command demo-rollout
+
+# Run the health failure & automatic rollback demonstration
+.\k8s\canary-traffic.ps1 -Command demo-rollback
+
+# Test header-based routing overrides (A/B testing)
+.\k8s\canary-traffic.ps1 -Command header
+
+# Dynamically set a specific split ratio (e.g. 70% stable, 30% canary)
+.\k8s\canary-traffic.ps1 -Command set-split -Stable 70 -Canary 30
+
+# Verify the actual live request distribution over 100 requests
+.\k8s\canary-traffic.ps1 -Command verify -Count 100
+```
+
+### 17.4 Actual Live Test Results
+
+```text
+======================================================================
+  STAGE 1: CANARY ACTIVATION (90% STABLE / 10% CANARY)
+======================================================================
+  Total Requests:  100
+  Successful:      100 | Failed: 0
+  Stable (v1):      90 hits ( 90.0%)
+  Canary (v2):      10 hits ( 10.0%)
+
+======================================================================
+  STAGE 2: TRAFFIC SPLIT RAMP-UP (50% STABLE / 50% CANARY)
+======================================================================
+  Total Requests:  100
+  Successful:      100 | Failed: 0
+  Stable (v1):      50 hits ( 50.0%)
+  Canary (v2):      50 hits ( 50.0%)
+
+======================================================================
+  STAGE 3: FULL PROMOTION (0% STABLE / 100% CANARY)
+======================================================================
+  Total Requests:  100
+  Successful:      100 | Failed: 0
+  Stable (v1):       0 hits (  0.0%)
+  Canary (v2):     100 hits (100.0%)
+
+======================================================================
+  STAGE 4: AUTOMATED ROLLBACK TO STABLE (100% STABLE / 0% CANARY)
+======================================================================
+  Total Requests:  100
+  Successful:      100 | Failed: 0
+  Stable (v1):     100 hits (100.0%)
+  Canary (v2):       0 hits (  0.0%)
+
+[Header-based Routing Overrides]
+  [PASS] X-Canary: always -> canary (v2)
+  [PASS] X-Canary: never  -> stable (v1)
+```
+
+

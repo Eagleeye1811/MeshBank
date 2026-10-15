@@ -1,5 +1,5 @@
 ---
-# Transaction Service — depends on account, fraud, notification
+# Transaction Service — with Service Mesh mTLS sidecar proxy
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,13 +29,16 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
       containers:
+        # Microservice Application Container (binds to loopback 127.0.0.1:8080)
         - name: transaction-service
           image: meshbank/transaction-service:dev
           imagePullPolicy: Never
+          args: ["uvicorn", "--factory", "app.main:create_app", "--host", "127.0.0.1", "--port", "8080", "--no-access-log"]
           ports:
-            - name: http
-              containerPort: 8003
+            - name: loopback
+              containerPort: 8080
           envFrom:
             - configMapRef:
                 name: meshbank-common
@@ -83,10 +86,66 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+
+        # Service Mesh Proxy Sidecar Container
+        - name: mesh-sidecar
+          image: nginx:alpine
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8003
+            - name: mesh-mtls
+              containerPort: 8443
+            - name: metrics
+              containerPort: 9102
+          volumeMounts:
+            - name: sidecar-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: mesh-certs
+              mountPath: /etc/mesh/certs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+
       volumes:
         - name: jwt-public-keys
           secret:
             secretName: jwt-public-keys
+        - name: sidecar-config
+          configMap:
+            name: transaction-sidecar-config
+        - name: mesh-certs
+          secret:
+            secretName: transaction-mesh-certs
+            defaultMode: 0440
         - name: tmp
           emptyDir: {}
         - name: data
@@ -104,3 +163,9 @@ spec:
     - name: http
       port: 8003
       targetPort: 8003
+    - name: mesh-mtls
+      port: 8443
+      targetPort: 8443
+    - name: metrics
+      port: 9102
+      targetPort: 9102

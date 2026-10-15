@@ -1,0 +1,34 @@
+---
+# Kubernetes NetworkPolicy for MeshBank Service Mesh.
+# Restricts inter-service communication so only authorized mesh mTLS traffic (port 8443)
+# and necessary infrastructure traffic (PostgreSQL, DNS) can flow.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mesh-default-policy
+  namespace: meshbank
+spec:
+  podSelector:
+    matchLabels:
+      meshbank-sidecar: "enabled"
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. Allow mTLS mesh traffic on port 8443 from any pod in meshbank namespace
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8443
+
+    # 2. Allow public HTTP traffic on ports 8003 & 8004 for external NodePort / Ingress / Smoke Tests
+    - ports:
+        - protocol: TCP
+          port: 8003
+        - protocol: TCP
+          port: 8004
+
+    # 3. Allow metrics scraping on port 9102
+    - ports:
+        - protocol: TCP
+          port: 9102

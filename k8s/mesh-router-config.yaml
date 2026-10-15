@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-router-config
+  namespace: meshbank
+data:
+  nginx.conf: |
+    pid /tmp/nginx.pid;
+    worker_processes 1;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp_path;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+
+        resolver 10.96.0.10 valid=10s ipv6=off;
+
+        log_format router_json escape=json '{'
+          '"time":"$time_iso8601",'
+          '"router":"payment-traffic-manager",'
+          '"client_ip":"$remote_addr",'
+          '"upstream":"$target_upstream",'
+          '"upstream_addr":"$upstream_addr",'
+          '"method":"$request_method",'
+          '"uri":"$request_uri",'
+          '"status":$status,'
+          '"request_time":$request_time'
+        '}';
+
+        access_log /dev/stdout router_json;
+        error_log /dev/stderr warn;
+
+        # 1. Direct Stable Upstream
+        upstream payment_stable_upstream {
+            server payment-service-stable.meshbank.svc.cluster.local:8004 max_fails=2 fail_timeout=5s;
+        }
+
+        # 2. Direct Canary Upstream
+        upstream payment_canary_upstream {
+            server payment-service-canary.meshbank.svc.cluster.local:8004 max_fails=2 fail_timeout=5s;
+        }
+
+        # 3. Dynamic Weighted Split Upstream
+        upstream payment_weighted_upstream {
+            server payment-service-stable.meshbank.svc.cluster.local:8004 weight=80 max_fails=2 fail_timeout=5s;
+            server payment-service-canary.meshbank.svc.cluster.local:8004 weight=20 max_fails=2 fail_timeout=5s;
+        }
+
+        # Header-based override for A/B testing
+        map $http_x_canary $target_upstream {
+            "always" "payment_canary_upstream";
+            "never"  "payment_stable_upstream";
+            default  "payment_weighted_upstream";
+        }
+
+        server {
+            listen 8004;
+            server_name _;
+
+            location / {
+                if ($request_method = 'OPTIONS') {
+                    add_header Access-Control-Allow-Origin "*" always;
+                    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS, PUT, DELETE" always;
+                    add_header Access-Control-Allow-Headers "*" always;
+                    return 204;
+                }
+
+                proxy_pass http://$target_upstream;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                
+                add_header Access-Control-Allow-Origin "*" always;
+                add_header Access-Control-Expose-Headers "X-Mesh-Track, X-Service-Version, X-Mesh-Router, Idempotent-Replayed" always;
+                add_header X-Mesh-Router "payment-traffic-manager" always;
+            }
+        }
+
+        server {
+            listen 9102;
+            server_name _;
+
+            location /metrics {
+                stub_status;
+            }
+
+            location /health {
+                default_type application/json;
+                add_header Access-Control-Allow-Origin "*" always;
+                return 200 '{"status":"ok","router":"payment-traffic-manager","target":"$target_upstream"}\n';
+            }
+        }
+    }

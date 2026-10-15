@@ -52,7 +52,7 @@ metadata:
 spec:
   type: NodePort
   selector:
-    app: payment-service
+    app: payment-router
   ports:
     - port: 8004
       targetPort: 8004

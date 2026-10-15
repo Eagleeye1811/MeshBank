@@ -1,17 +1,20 @@
 ---
+# Payment Service Stable Deployment (Track: stable, Version: v1)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: payment-service
   namespace: meshbank
   labels:
-    app: payment-service
+    app: payment-service-backend
+    track: stable
     version: "1"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: payment-service
+      app: payment-service-backend
+      track: stable
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -20,7 +23,8 @@ spec:
   template:
     metadata:
       labels:
-        app: payment-service
+        app: payment-service-backend
+        track: stable
         version: "1"
         meshbank-sidecar: "enabled"
     spec:
@@ -28,23 +32,34 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
       containers:
+        # Microservice Application Container (binds to loopback 127.0.0.1:8080)
         - name: payment-service
           image: meshbank/payment-service:dev
           imagePullPolicy: Never
+          args: ["uvicorn", "--factory", "app.main:create_app", "--host", "127.0.0.1", "--port", "8080", "--no-access-log"]
           ports:
-            - name: http
-              containerPort: 8004
+            - name: loopback
+              containerPort: 8080
           envFrom:
             - configMapRef:
                 name: meshbank-common
           env:
             - name: DATABASE_URL
               value: "postgresql+psycopg://payment_svc:meshbank_payment_dev@postgres:5432/meshbank_payment"
+            # Route transaction service calls through the local egress sidecar proxy (127.0.0.1:9003)
+            # The sidecar wraps requests with mTLS and payment-service's client certificate
+            - name: TRANSACTION_SERVICE_URL
+              value: "http://127.0.0.1:9003"
             - name: PAYMENT_PROVIDER_DECLINE_PREFIX
               value: "DECLINE"
             - name: PAYMENT_PROVIDER_MAX_AMOUNT
               value: "100000.00"
+            - name: SERVICE_TRACK
+              value: "stable"
+            - name: SERVICE_VERSION
+              value: "v1"
             - name: INTERNAL_API_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -86,15 +101,72 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+
+        # Service Mesh Proxy Sidecar Container
+        - name: mesh-sidecar
+          image: nginx:alpine
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8004
+            - name: mesh-mtls
+              containerPort: 8443
+            - name: metrics
+              containerPort: 9102
+          volumeMounts:
+            - name: sidecar-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: mesh-certs
+              mountPath: /etc/mesh/certs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9102
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+
       volumes:
         - name: jwt-public-keys
           secret:
             secretName: jwt-public-keys
+        - name: sidecar-config
+          configMap:
+            name: payment-sidecar-config
+        - name: mesh-certs
+          secret:
+            secretName: payment-mesh-certs
+            defaultMode: 0440
         - name: tmp
           emptyDir: {}
         - name: data
           emptyDir: {}
 ---
+# Main payment-service Service — routes to payment-router for traffic splitting
 apiVersion: v1
 kind: Service
 metadata:
@@ -102,8 +174,11 @@ metadata:
   namespace: meshbank
 spec:
   selector:
-    app: payment-service
+    app: payment-router
   ports:
     - name: http
       port: 8004
       targetPort: 8004
+    - name: metrics
+      port: 9102
+      targetPort: 9102
