@@ -1,0 +1,167 @@
+# MeshBank Phase 1 — local development stack (no Kubernetes, no service mesh).
+#
+#   make dev-keys           # once: RS256 key pair in ./secrets/jwt (git-ignored)
+#   cp .env.example .env    # optional; empty secrets fall back to dev-only values
+#   docker compose up --build -d
+#
+# Internal traffic on this bridge network is plain HTTP. It is NOT encrypted and
+# NOT a multi-cloud service mesh; mTLS and sidecars arrive in later phases.
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [meshbank]
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  # Bounded resources so one misbehaving service cannot starve the others.
+  pids_limit: 256
+  mem_limit: 256m
+  cpus: 0.5
+  environment: &common-env
+    APP_ENV: ${APP_ENV:-development}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # Public verification keys only, mounted read-only into every service; the
+    # private signing key is given to the auth service alone (see secrets).
+    JWT_PUBLIC_KEYS_DIR: /run/meshbank/jwt-public
+    JWT_ISSUER: ${JWT_ISSUER:-meshbank-auth}
+    JWT_AUDIENCE: ${JWT_AUDIENCE:-meshbank-api}
+    INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-}
+    HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-3}
+    # Existing Phase 1 volumes hold SQLite schemas created without Alembic
+    # history, so 'upgrade' would fail on them. 'create_all' only adds missing
+    # tables and never alters or drops data. Use 'upgrade' for fresh volumes;
+    # production rejects 'create_all' and uses PostgreSQL with 'check'.
+    DB_MIGRATION_MODE: ${DB_MIGRATION_MODE:-create_all}
+    ACCOUNT_SERVICE_URL: http://account-service:8002
+    TRANSACTION_SERVICE_URL: http://transaction-service:8003
+    FRAUD_SERVICE_URL: http://fraud-service:8005
+    NOTIFICATION_SERVICE_URL: http://notification-service:8006
+
+x-ready-check: &ready-check
+  interval: 10s
+  timeout: 3s
+  start_period: 10s
+  retries: 5
+
+services:
+  auth-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/auth-service/Dockerfile }
+    image: meshbank/auth-service:dev
+    mem_limit: 512m  # Argon2id uses 64 MiB per concurrent hash
+    cpus: 1.0
+    ports: ["127.0.0.1:8001:8001"]  # host loopback only
+    environment:
+      <<: *common-env
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
+      JWT_SIGNING_KEY_ID: ${JWT_SIGNING_KEY_ID:-dev-local-1}
+      JWT_PRIVATE_KEY_FILE: /run/secrets/jwt_signing_key
+      # Empty: clients reach auth directly (no reverse proxy), so X-Forwarded-For
+      # is ignored and throttling keys on the TCP peer address.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+    secrets: [jwt_signing_key]
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, auth-data:/data]
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=2).status != 200)"]
+
+  account-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/account-service/Dockerfile }
+    image: meshbank/account-service:dev
+    ports: ["127.0.0.1:8002:8002"]  # host loopback only
+    environment:
+      <<: *common-env
+      # Development only: enables /internal/dev/... balance seeding.
+      DEV_SEED_ENABLED: ${DEV_SEED_ENABLED:-true}
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, account-data:/data]
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=2).status != 200)"]
+
+  transaction-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/transaction-service/Dockerfile }
+    image: meshbank/transaction-service:dev
+    ports: ["127.0.0.1:8003:8003"]  # host loopback only
+    environment:
+      <<: *common-env
+      RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-30}
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, transaction-data:/data]
+    # Ordering is a convenience only: the service tolerates dependencies that
+    # are down (it returns 503 and its recovery loop retries later).
+    depends_on:
+      account-service: { condition: service_started }
+      fraud-service: { condition: service_started }
+      notification-service: { condition: service_started }
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8003/ready', timeout=2).status != 200)"]
+
+  payment-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/payment-service/Dockerfile }
+    image: meshbank/payment-service:dev
+    ports: ["127.0.0.1:8004:8004"]  # host loopback only
+    environment:
+      <<: *common-env
+      RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-30}
+      PAYMENT_PROVIDER_DECLINE_PREFIX: ${PAYMENT_PROVIDER_DECLINE_PREFIX:-DECLINE}
+      PAYMENT_PROVIDER_MAX_AMOUNT: ${PAYMENT_PROVIDER_MAX_AMOUNT:-100000.00}
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, payment-data:/data]
+    depends_on:
+      transaction-service: { condition: service_started }
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8004/ready', timeout=2).status != 200)"]
+
+  fraud-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/fraud-service/Dockerfile }
+    image: meshbank/fraud-service:dev
+    ports: ["127.0.0.1:8005:8005"]  # host loopback only
+    environment:
+      <<: *common-env
+      FRAUD_REVIEW_THRESHOLD: ${FRAUD_REVIEW_THRESHOLD:-50000.00}
+      FRAUD_HARD_LIMIT: ${FRAUD_HARD_LIMIT:-200000.00}
+      FRAUD_HARD_LIMIT_ACTION: ${FRAUD_HARD_LIMIT_ACTION:-REJECT}
+      FRAUD_BLOCKED_PAYEES: ${FRAUD_BLOCKED_PAYEES:-}
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, fraud-data:/data]
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8005/ready', timeout=2).status != 200)"]
+
+  notification-service:
+    <<: *service-defaults
+    build: { context: ., dockerfile: services/notification-service/Dockerfile }
+    image: meshbank/notification-service:dev
+    ports: ["127.0.0.1:8006:8006"]  # host loopback only
+    environment:
+      <<: *common-env
+      NOTIFICATION_DELIVERY_LOG: /data/notification-deliveries.log
+      NOTIFICATION_SIMULATED_FAILURE_TYPES: ${NOTIFICATION_SIMULATED_FAILURE_TYPES:-}
+    volumes: [./secrets/jwt/public:/run/meshbank/jwt-public:ro, notification-data:/data]
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8006/ready', timeout=2).status != 200)"]
+
+# Development secret file from `make dev-keys`. Compose bind-mounts it read-only.
+# On Docker Desktop (macOS) the 0600 host file is readable by the container
+# user; on a Linux host it must be readable by uid 10001.
+secrets:
+  jwt_signing_key:
+    file: ./secrets/jwt/private/${JWT_SIGNING_KEY_ID:-dev-local-1}.pem
+
+networks:
+  meshbank:
+    name: meshbank
+
+# One volume per service: each service owns its persistence boundary.
+volumes:
+  auth-data:
+  account-data:
+  transaction-data:
+  payment-data:
+  fraud-data:
+  notification-data:

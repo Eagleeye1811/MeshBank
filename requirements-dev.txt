@@ -1,0 +1,10 @@
+# Local development: every service's runtime deps + test/lint tooling.
+-r services/auth-service/requirements.txt
+-r services/account-service/requirements.txt
+-r services/transaction-service/requirements.txt
+-r services/payment-service/requirements.txt
+-r services/fraud-service/requirements.txt
+-r services/notification-service/requirements.txt
+pytest==8.3.4
+ruff==0.8.4
+-e ./shared

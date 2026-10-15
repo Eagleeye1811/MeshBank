@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshbank-common"
+version = "0.1.0"
+description = "Shared, transport-agnostic utilities for MeshBank services"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.115.6",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "SQLAlchemy==2.0.36",
+    "httpx==0.28.1",
+    "PyJWT==2.10.1",
+    "cryptography==44.0.0",
+    "alembic==1.14.0",
+    "psycopg[binary]==3.2.3",
+]
+
+[tool.setuptools]
+packages = ["common"]

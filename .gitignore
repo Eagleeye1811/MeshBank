@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local data (SQLite databases, simulated delivery logs)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Secrets: never commit real environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
