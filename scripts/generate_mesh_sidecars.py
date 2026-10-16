@@ -318,7 +318,9 @@ stream {{
     error_log /dev/stderr warn;
 
     # Routable services: those {other} workloads are authorized to call. Any
-    # other server name is sent to a closed port, i.e. refused.
+    # other server name is sent to a closed port, i.e. refused. Cluster DNS
+    # names outgrow the default 64-byte map bucket, so nginx would not start.
+    map_hash_bucket_size 128;
     map $ssl_preread_server_name $mesh_target {{{routes}
         default 127.0.0.1:1;
     }}

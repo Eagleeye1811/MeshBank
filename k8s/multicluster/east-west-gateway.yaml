@@ -36,7 +36,9 @@ data:
         error_log /dev/stderr warn;
 
         # Routable services: those gcp workloads are authorized to call. Any
-        # other server name is sent to a closed port, i.e. refused.
+        # other server name is sent to a closed port, i.e. refused. Cluster DNS
+        # names outgrow the default 64-byte map bucket, so nginx would not start.
+        map_hash_bucket_size 128;
         map $ssl_preread_server_name $mesh_target {
             account-service.meshbank.svc.cluster.local account-service.meshbank.svc.cluster.local:8443;
             transaction-service.meshbank.svc.cluster.local transaction-service.meshbank.svc.cluster.local:8443;
@@ -192,7 +194,9 @@ data:
         error_log /dev/stderr warn;
 
         # Routable services: those aws workloads are authorized to call. Any
-        # other server name is sent to a closed port, i.e. refused.
+        # other server name is sent to a closed port, i.e. refused. Cluster DNS
+        # names outgrow the default 64-byte map bucket, so nginx would not start.
+        map_hash_bucket_size 128;
         map $ssl_preread_server_name $mesh_target {
             fraud-service.meshbank.svc.cluster.local fraud-service.meshbank.svc.cluster.local:8443;
             notification-service.meshbank.svc.cluster.local notification-service.meshbank.svc.cluster.local:8443;
