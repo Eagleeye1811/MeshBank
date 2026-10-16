@@ -6,13 +6,13 @@ import Banking from './Banking.jsx';
 import System from './System.jsx';
 import { Button, Card, Notice, Toasts } from './ui.jsx';
 
-// Pick whichever deployment is answering: Kubernetes first, then this computer.
-async function detectEnvironment() {
-  for (const key of ['k8s', 'docker']) {
-    const res = await call(`${serviceUrl(key, 'auth')}/health`, { timeout: 1500 });
-    if (res.ok) return key;
-  }
-  return 'k8s';
+// Which environments are answering right now: { k8s: true|false, docker: true|false }.
+async function probeEnvironments() {
+  const keys = Object.keys(ENVIRONMENTS);
+  const results = await Promise.all(
+    keys.map(key => call(`${serviceUrl(key, 'auth')}/health`, { timeout: 2000 })),
+  );
+  return Object.fromEntries(keys.map((key, i) => [key, results[i].ok]));
 }
 
 export default function App() {
@@ -20,10 +20,26 @@ export default function App() {
   const [page, setPage] = useState(() => store.read('meshbank_page', 'banking'));
   const [session, setSession] = useState(null); // { customerKey, token }
   const [toasts, setToasts] = useState([]);
+  const [reachable, setReachable] = useState({});
 
+  // Keep checking both environments, so the page can say where MeshBank is
+  // actually running (and notice when it starts or stops).
   useEffect(() => {
-    if (!envKey) detectEnvironment().then(setEnvKey);
-  }, [envKey]);
+    let alive = true;
+    const check = async () => {
+      const result = await probeEnvironments();
+      if (!alive) return;
+      setReachable(result);
+      // First visit: use whichever is running, Kubernetes first.
+      setEnvKey(current => current ?? (result.k8s ? 'k8s' : result.docker ? 'docker' : 'k8s'));
+    };
+    check();
+    const timer = setInterval(check, 10000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
 
   // Each environment has its own databases, so it has its own signed-in customer.
   useEffect(() => {
@@ -107,7 +123,11 @@ export default function App() {
                 onChange={e => chooseEnv(e.target.value)}
                 className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-900"
               >
-                {Object.entries(ENVIRONMENTS).map(([key, env]) => <option key={key} value={key}>{env.label}</option>)}
+                {Object.entries(ENVIRONMENTS).map(([key, env]) => (
+                  <option key={key} value={key}>
+                    {env.label}{reachable[key] === false ? ' (not running)' : ''}
+                  </option>
+                ))}
               </select>
             </label>
             {session && (
@@ -127,7 +147,8 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        <ConnectionBanner envKey={envKey} reachable={reachable} onSwitch={chooseEnv} />
         {page === 'system' ? (
           <System envKey={envKey} customerKey={session?.customerKey} token={session?.token} />
         ) : session ? (
@@ -146,6 +167,28 @@ export default function App() {
 
       <Toasts toasts={toasts} />
     </div>
+  );
+}
+
+function ConnectionBanner({ envKey, reachable, onSwitch }) {
+  if (reachable[envKey] !== false) return null;
+  const here = ENVIRONMENTS[envKey].label;
+  const other = Object.keys(ENVIRONMENTS).find(key => key !== envKey && reachable[key]);
+  if (other) {
+    return (
+      <Notice tone="warn" title={`MeshBank is not running on ${here}`}>
+        <p>It is running {other === 'docker' ? 'on this computer' : `on ${ENVIRONMENTS[other].label}`}.</p>
+        <Button className="mt-3" onClick={() => onSwitch(other)}>
+          Switch to {ENVIRONMENTS[other].label.toLowerCase()}
+        </Button>
+      </Notice>
+    );
+  }
+  return (
+    <Notice tone="warn" title="MeshBank is not running">
+      Start it with <code className="font-mono">make run</code> (on this computer) or{' '}
+      <code className="font-mono">make k8s-up</code> (Kubernetes). This page reconnects by itself.
+    </Notice>
   );
 }
 
@@ -195,7 +238,8 @@ function ChooseCustomer({ envKey, onSignedIn }) {
       {busy && <p className="text-center text-sm text-slate-500">Getting the demo ready…</p>}
       {problem && (
         <Notice tone="bad" title="Could not sign in">
-          {problem}. Check that MeshBank is running ({ENVIRONMENTS[envKey].hint}) and that “Running on” matches.
+          <p>{problem}</p>
+          <p className="mt-1">Check that MeshBank is running ({ENVIRONMENTS[envKey].hint}) and that “Running on” matches.</p>
         </Notice>
       )}
     </div>
